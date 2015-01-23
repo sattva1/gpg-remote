@@ -1,6 +1,6 @@
 
-                               GPG REMOTE
-                               ==========
+GPG REMOTE
+==========
 
 
 Motivation
@@ -147,6 +147,7 @@ format for both directions is as follows:
   * binary (bytes): Concatenated files data.
 
 Default server listening port (29797) was produced in Python as follows:
+
   int.from_bytes(b'gpgremote', 'big') % 2 ** 16
 
 
@@ -199,7 +200,10 @@ Author
 ------
 
 Vlad "SATtva" Miller
+
 sattva@vladmiller.info
+
 http://vladmiller.info
+
 0x8443620A
 
