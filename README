@@ -1,0 +1,205 @@
+
+                               GPG REMOTE
+                               ==========
+
+
+Motivation
+----------
+
+Using GnuPG in a networked environment always poses certain risk that a
+remote attacker who is able to compromise one of the client applications
+(e.g. MUA, IM client, etc.) could easily leak the private key by calling
+gpg --export-secret-keys. A common mitigation of such risk are smartcards,
+however they are specialized hardware which a) may not be readily avail-
+able, or b) could be not trusted for various of reasons.
+
+
+Overview
+--------
+
+GPG Remote is a client-server application allowing to delegate GnuPG
+private key operations to a remote server running in a trusted environment.
+Server filters client input according to specified rules, and runs GnuPG
+operations on behalf of a client.
+
+GPG Remote separates GnuPG execution between a front-end client and a
+back-end server. The client tries to replicate GnuPG command line inter-
+face, taking up command line arguments and STDIN data. Internally, it then
+parses args input, figures out files which the user may want to process,
+packs all that into a request package, and sends it to the server.
+
+The server operating in a trusted environment is tasked to execute gpg in a
+safe manner. For this end it uses a whitelist of gpg command line options
+to filter out everything inappropriate of the received client command line
+arguments (especially, commands like --export-secret-keys). Files received
+from the client are saved into temporary location, and their paths in
+command line arguments are updated accordingly. Finally, gpg is called,
+and its output (comprised of STDERR, STDOUT, exit code, as well as newly
+generates files) is sent back to client.
+
+
+Installation
+------------
+
+Make sure you have Python 3.2.x or later installed on all systems you plan
+to use for client and server operation. Both client and server modules are
+self-contained, and can be placed anywhere on the system.
+
+Running GPG Remote Client as a drop-in replacement for system-wide gpg
+requires gpgremote_client.py script to be moved to or symlinked from
+/usr/bin/gpg path. If both components are running on the same system,
+ensure only the server user has read-write access to GnuPG keyring files.
+
+
+Configuration
+-------------
+
+The client reads configuration data (specifically, server listening
+host:port) from gpgremote_client.conf file located in ~/.gnupg directory
+unless path is overridden with GNUPGHOME environment variable.
+
+By default server reads its configuration from gpgremote_server.conf file
+located in ~/.gnupg (the path can be overridden with GNUPGHOME environment
+variable). However, specific path can be provided with -c/--config option to
+server invocation (-h/--help will print all available options). Most server
+parameters can be reconfigured from the command line as well.
+
+The second part of server configuration is gpg options whitelist defined in
+whitelist.conf in the same directory as server config file. See whitelist
+rules specification in the default whitelist.conf file.
+
+
+Security considerations
+-----------------------
+
+The threat model and main attack scenario is a client-side remote attacker
+(e.g. compromised network application) exfiltrating gpg private keys. The
+server mitigates this risk by using gpg command line options whitelist.
+
+Note that even if keyring modifying options (e.g. --delete-key, --import)
+are not whitelisted, client user would still be able to add keys to the
+keyring by simply sending them to STDIN (gpg processes it contextually).
+If this should be avoided, it's up to the server administrator to run the
+server as a user without write access to gpg keyring files. Remember that
+default gpg keyrings can be overridden with --secret-keyring and --keyring
+options.
+
+Another potential risk to the server is its local files exfiltration. In
+the naive case the user could ask the server to run gpg -o - --enarmor
+[path_to_local_file], and the server would happily send that file contents
+in STDOUT. In order to protect against such attacks the server makes sure
+the number of filename arguments is equal to the number of files received
+in client request package. (These complications are necessary as simply
+refusing to process requests containing server local filepaths would lead
+to information leakage about server filesystem contents.) However, it
+requires correct configuration of the server whitelist in respect to
+options parameter specification: in case an option accepts parameters,
+its set MUST include parameter wildcard/value, otherwise the server might
+become vulnerable to the described attack.
+
+Note also that a number of gpg command line options (namely, --list-keys,
+--list-sigs, etc.) receive arbitrary amount of non-file arguments. This
+case is supported with special [#NO_FILES] placeholder. If such an option
+is provided by the client, the server strips out any -o/--output options,
+and prevents sending any files back to the client.
+
+Files received from the client (which may contain sensitive cleartext data)
+are written by the server to a temporary location. By default it is a
+system-wide temp directory (commonly, /tmp), but in case this directory is
+unsafe, it can be overridden using TEMP environment variable, or --temp
+command line option for server invocation. (Note that files aren't written
+directly to tempdir, but to temporary subdirectories with 0700 access
+mode).
+
+As neither client nor server employ any semantic analysis of command line
+arguments (i.e. does not understand the meaning of options and commands),
+the client assumes an option parameter or trailing argument named as an
+existing client local file to be a file indended for gpg processing, and
+optimistically sends it to the server. Note that client unconditionally
+writes out all files received from the server (on the assumption it has
+write access to a given path) without asking for overwrite if the same file
+exist.
+
+Client connections are not authenticated, and all requests are considered
+untrusted. Still, the client may try to cause DoS on the server by sending
+it excessively huge input. This scenario is addressed with server resources
+limitation parameters: size_limit and threads. The first limits the size of
+client request package and, as a result, memory usage. The second limits
+the number of CPU threads used for requests processing (each request is
+single-threaded). Note that the total amount of RAM the server might use is
+around S * T * 2, where S is the package size limit and T is the threads
+count (i.e. with default S=1GB and T=2 maximum RAM usage would be 4 GB).
+
+
+Technical details
+-----------------
+
+Communication protocol is a simple two-step request-response. Package
+format for both directions is as follows:
+
+  [len_p] | [len_j] | JSON([type], [fields], [files_meta]) | [binary]
+
+  * len_p (8 bytes): Overall package length.
+  * len_i (8 bytes): JSON packet length.
+  * type (str): Package identifier.
+  * fields (list): Arbitrary data fields.
+  * files_meta (dict): File_pathname->file_len mapping.
+  * binary (bytes): Concatenated files data.
+
+Default server listening port (29797) was produced in Python as follows:
+  int.from_bytes(b'gpgremote', 'big') % 2 ** 16
+
+
+Issues, limitations
+-------------------
+
+* Interactive passphrase input is not supported, the server can only
+  operate with unprotected private keys. An alternative is to provide
+  passphrase with --passphrase{-file} gpg option.
+
+* Passing file descriptors and implementing other forms of advanced IPC
+  interaction with gpg is not supported.
+
+* No environment variables are passed from the client. If gpg must be
+  invoked with specific environment (e.g. LANG), start GPG Remote Server
+  with all the necessary variables instead.
+
+* If GnuPG 2.x or higher is used, secret key operations would spawn
+  gpg-agent dialog which will prevent gpg process from terminating. This
+  might be a feature if both GPG Remote server and client are running on
+  the same system (however make sure client's conn_timeout and server's
+  gpg_timeout are high enough for the user to type passphrase in time),
+  otherwise it's up to the server administrator to disable gpg-agent
+  server-side.
+
+
+ToDo
+----
+
+* Minimize memory footprint.
+* gpg-agent interaction for passphrase input.
+* Idea: "Panic" passphrase to stop server / wipe private keys.
+
+
+Version history
+---------------
+
+2015-01-XX v0.9b2 -- Fixed "--output -" case.
+
+2015-01-23 v0.9b1 -- First beta release.
+
+
+License
+-------
+
+See COPYING.
+
+
+Author
+------
+
+Vlad "SATtva" Miller
+sattva@vladmiller.info
+http://vladmiller.info
+0x8443620A
+
