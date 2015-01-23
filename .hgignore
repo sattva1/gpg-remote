@@ -1,3 +1,4 @@
+glob:*.e4p
 glob:.eric5project
 glob:_eric5project
 glob:.eric4project
