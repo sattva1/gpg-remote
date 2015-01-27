@@ -10,6 +10,38 @@ import unittest, tempfile
 import gpgremote_client as client
 
 
+class TestUpdateConfig(unittest.TestCase):
+    """Config parser tests."""
+
+    def test_parse(self):
+        """Parse proper config file."""
+        with tempfile.NamedTemporaryFile(prefix='gpgremote_test_',
+                                         mode='wt', delete=False) as file:
+            file.write("""
+# Comment.
+
+foo = bar
+value = 1
+flag
+""")
+        parsed = {}
+        expected = {'foo': 'bar', 'value': 1, 'flag': True}
+        client.update_config(file.name, parsed)
+        self.assertEqual(parsed, expected)
+
+    def test_silent(self):
+        """Supress errors in silent mode."""
+        parsed = {'foo': 'bar'}
+        expected = {'foo': 'bar'}
+        client.update_config('/foobar', parsed)
+        self.assertEqual(parsed, expected)
+
+    def test_nonsilent(self):
+        """Raise error in non-silent mode."""
+        self.assertRaises(ValueError, client.update_config,
+                          '/foobar', {}, silent=False)
+
+
 class TestParseOptions(unittest.TestCase):
     """Command line arguments parsing tests."""
 

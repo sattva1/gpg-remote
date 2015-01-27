@@ -258,7 +258,7 @@ class TestGetNoFilesFlag(unittest.TestCase):
         self.assertIs(flag, True)
 
 
-class TestOption(unittest.TestCase):
+class TestGetOption(unittest.TestCase):
     """Get option value if any."""
 
     def test_no_output(self):
@@ -285,6 +285,39 @@ class TestOption(unittest.TestCase):
                 ('--output', 'another_path')]
         output = server.get_option(args, server.OUTPUT_OPTS, get_all=True)
         self.assertEqual(output, [('some/path', 0), ('another_path', 2)])
+
+
+class TestDelOptions(unittest.TestCase):
+    """Remove options from args list."""
+
+    def test_opts(self):
+        """Remove existing options."""
+        args = [('--foo', 'param'), ('--bar', None), ('-x', 'val')]
+        output = server.del_options(args, ['--foo', '--bar'])
+        self.assertEqual(output, [('-x', 'val')])
+
+    def test_trailing(self):
+        """Remove trailing arguments."""
+        args = [('--foo', 'param'), (None, 'arg1'), (None, 'arg2')]
+        output = server.del_options(args, [None])
+        self.assertEqual(output, [('--foo', 'param')])
+
+    def test_missing(self):
+        """Skip missing options."""
+        args = [('--foo', 'param'), ('--bar', None), ('-x', 'val')]
+        output = server.del_options(args, ['-z', '--blah'])
+        self.assertEqual(output, args)
+
+class TestFlattenArgs(unittest.TestCase):
+    """Parsed args conversion into a flat list."""
+
+    def test_flatten(self):
+        """Flatten parsed arguments."""
+        args = [('--foo', 'param'), ('--bar', None), (None, 'arg1')]
+        output = server.flatten_args(args)
+        self.assertEqual(output, ['--foo', 'param', '--bar', 'arg1'])
+
+
 
 
 if __name__ == '__main__':

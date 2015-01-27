@@ -46,6 +46,17 @@ class TestPackage(unittest.TestCase):
         self.assertEqual(unpacked_fields, fields)
         self.assertEqual(unpacked_files, files)
 
+    def test_version_mismatch(self):
+        """Raise error in case of version mismatch."""
+        length, package = client.pack('test_id', ['foo', 'bar'])
+        # Update version string in-place. The version must begin at
+        # index 10 (8-byte header + [" JSON types stuff).
+        package.seek(10)
+        package.write(b'Z')
+        package.seek(0)
+        self.assertRaises(server.VersionMismatchError,
+                          server.unpack, package)
+
 
 class TestTransmission(unittest.TestCase):
     """Data tranfer tests."""

@@ -10,8 +10,8 @@ Using GnuPG in a networked environment always poses certain risk that a
 remote attacker who is able to compromise one of the client applications
 (e.g. MUA, IM client, etc.) could easily leak the private key by calling
 gpg --export-secret-keys. A common mitigation of such risk are smartcards,
-however they are specialized hardware which a) may not be readily avail-
-able, or b) could be not trusted for various of reasons.
+however they are specialized hardware which a) may not be readily
+available, or b) could be not trusted for various of reasons.
 
 
 Overview
@@ -23,10 +23,10 @@ Server filters client input according to specified rules, and runs GnuPG
 operations on behalf of a client.
 
 GPG Remote separates GnuPG execution between a front-end client and a
-back-end server. The client tries to replicate GnuPG command line inter-
-face, taking up command line arguments and STDIN data. Internally, it then
-parses args input, figures out files which the user may want to process,
-packs all that into a request package, and sends it to the server.
+back-end server. The client tries to replicate GnuPG command line
+interface, taking up command line arguments and STDIN data. Internally,
+it then parses args input, figures out files which the user may want to
+process, packs all that into a request package, and sends it to the server.
 
 The server operating in a trusted environment is tasked to execute gpg in a
 safe manner. For this end it uses a whitelist of gpg command line options
@@ -60,9 +60,9 @@ unless path is overridden with GNUPGHOME environment variable.
 
 By default server reads its configuration from gpgremote_server.conf file
 located in ~/.gnupg (the path can be overridden with GNUPGHOME environment
-variable). However, specific path can be provided with -c/--config option to
-server invocation (-h/--help will print all available options). Most server
-parameters can be reconfigured from the command line as well.
+variable). However, specific path can be provided with -c/--config option
+to server invocation (-h/--help will print all available options). Most
+server parameters can be reconfigured from the command line as well.
 
 The second part of server configuration is gpg options whitelist defined in
 whitelist.conf in the same directory as server config file. See whitelist
@@ -120,15 +120,22 @@ writes out all files received from the server (on the assumption it has
 write access to a given path) without asking for overwrite if the same file
 exist.
 
-Client connections are not authenticated, and all requests are considered
-untrusted. Still, the client may try to cause DoS on the server by sending
-it excessively huge input. This scenario is addressed with server resources
-limitation parameters: size_limit and threads. The first limits the size of
+The client may try to cause DoS on the server by sending it excessively
+huge input(s). This scenario is addressed with server resources management
+parameters: size_limit, threads and queue. The first limits the size of
 client request package and, as a result, memory usage. The second limits
 the number of CPU threads used for requests processing (each request is
 single-threaded). Note that the total amount of RAM the server might use is
 around S * T * 2, where S is the package size limit and T is the threads
 count (i.e. with default S=1GB and T=2 maximum RAM usage would be 4 GB).
+Finally, the queue value is the amount of requests that can be queued for
+processing. If the value is higher than threads count then the remaining
+requests will wait until active ones are finished. Awaiting requests does
+not take up additional resources except for a socket connection.
+
+Communication channel authentication/encryption is out of the scope of this
+application. The user may employ SSH or VPN tunnelling to create a trusted
+channel for client-server communication.
 
 
 Technical details
@@ -137,10 +144,11 @@ Technical details
 Communication protocol is a simple two-step request-response. Package
 format for both directions is as follows:
 
-  [len_p] | [len_j] | JSON([type], [fields], [files_meta]) | [binary]
+  [len_p] | [len_j] | JSON([ver], [type], [fields], [files_meta]) | [binary]
 
   * len_p (8 bytes): Overall package length.
   * len_i (8 bytes): JSON packet length.
+  * ver (str): Application version.
   * type (str): Package identifier.
   * fields (list): Arbitrary data fields.
   * files_meta (dict): File_pathname->file_len mapping.
@@ -148,8 +156,11 @@ format for both directions is as follows:
 
 Default server listening port (29797) was produced in Python as follows:
 
-  int.from_bytes(b'gpgremote', 'big') % 2 ** 16
+```
+#!python
 
+int.from_bytes(b'gpgremote', 'big') % 2 ** 16
+```
 
 Issues, limitations
 -------------------
@@ -178,16 +189,25 @@ ToDo
 ----
 
 * Minimize memory footprint.
+
 * gpg-agent interaction for passphrase input.
+
 * Idea: "Panic" passphrase to stop server / wipe private keys.
 
 
 Version history
 ---------------
 
-2015-01-XX v0.9b2 -- Fixed "--output -" case.
+* 2015-01-XX v0.9b2
 
-2015-01-23 v0.9b1 -- First beta release.
+  - Fixed "--output -" case.
+  - Versioned protocol.
+  - Config parser updates.
+  - More unittest coverage.
+
+* 2015-01-23 v0.9b1
+
+  - First beta release.
 
 
 License

@@ -88,6 +88,10 @@ class PackageError(GPGRemoteException):
     pass
 
 
+class VersionMismatchError(GPGRemoteException):
+    pass
+
+
 class RequestError(GPGRemoteException):
     pass
 
@@ -123,17 +127,18 @@ def handle_exc(*exc):
 # This section is identical for both client and server but duplicated
 # in order to keep modules self-contained.
 
-def update_config(path, silent=True):
+def update_config(path, storage, silent=True):
     """ Update application configuration from the conf file (if exists).
 
         The function attempts to read the conf file at provided path, and
-        update CONFIG dict with its parsed contents. The format for the
-        configuration file is "key = value" for str value, or "key" for
-        bool values; blank lines and lines starting with hash sign are
+        update configuration dict with its parsed contents. The format for
+        the configuration file is "key = value" for str/int value, or "key"
+        for bool values; blank lines and lines starting with hash sign are
         ignored.
 
         Args:
             path (str): Configuration file pathname.
+            storage (dict): Configuration storage to update in-place.
             silent (bool): Supress any errors.
 
         Raises:
@@ -147,7 +152,12 @@ def update_config(path, silent=True):
                 if line.startswith('#') or not line:
                     continue
                 key, separator, value = line.partition('=')
-                CONFIG[key.strip()] = value.strip() if separator else True
+                key, value = key.strip(), value.strip()
+
+                if value.isdecimal():
+                    storage[key] = int(value)
+                else:
+                    storage[key] = value if separator else True
     except:
         if silent:
             return
@@ -170,7 +180,7 @@ def pack(identifier, *fields, files=None):
 
         The package is a structure of the following format:
 
-        header|JSON(identifier, fields, files_meta)|binary,
+        header|JSON(version, identifier, fields, files_meta)|binary,
 
         where header is a 64-bit (8 bytes) JSON packet length header, and
         binary is a concatenated binary data of all included files.
@@ -182,7 +192,7 @@ def pack(identifier, *fields, files=None):
     files = files or {}
 
     files_meta = [(name, len(data)) for name, data in files.items()]
-    package = json.dumps([identifier, fields, files_meta],
+    package = json.dumps([__version__, identifier, fields, files_meta],
                          ensure_ascii=False, separators=(',', ':')).encode()
 
     # Writing header.
@@ -210,16 +220,23 @@ def unpack(package):
 
         Raises:
             PackageError: In case of malformed package.
+            VersionMismatchError: In case the package was created with a
+                different application version. Packer version is passed as
+                exception's first argument.
     """
     try:
         length = int.from_bytes(package.read(HEADER_LEN), 'big')
-        identifier, fields, files_meta = json.loads(
+        version, identifier, fields, files_meta = json.loads(
                                             package.read(length).decode())
-        files = {filename: package.read(length)
-                 for filename, length in files_meta}
-        return identifier, fields, files
+        if version == __version__:
+            files = {filename: package.read(length)
+                     for filename, length in files_meta}
+            return identifier, fields, files
     except:
         raise PackageError
+
+    # Can get here only in case of version mismatch.
+    raise VersionMismatchError(version)
 
 
 def send(length, data, conn, _override_length=None):
@@ -231,7 +248,7 @@ def send(length, data, conn, _override_length=None):
             length (int): Stream length.
             data (io.BytesIO): Data to be sent.
             conn (socket.socket): Connection instance.
-            _override_length (int): Use for debugging only.
+            _override_length (int): For debugging only.
 
         Raises:
             TransmissionError: In case of abruptly terminated connection.
@@ -426,7 +443,7 @@ def process_options():
             CONFIG['verbosity'] = param
         elif opt in ('-c', '--config'):
             try:
-                update_config(param, silent=False)
+                update_config(param, CONFIG, silent=False)
             except ValueError:
                 error_exit('Unable to read or parse configuration '
                            'file "{}"'.format(param))
@@ -694,6 +711,8 @@ def del_options(args, blacklist):
         Returns:
             (list) Command line arguments without defined options.
     """
+    if not isinstance(blacklist, list):
+        blacklist = list(blacklist)
     return [element for element in args if element[0] not in blacklist]
 
 
@@ -1185,7 +1204,8 @@ class Handler(BaseRequestHandler):
 
         except handle_exc(AttributeError, RequestError,
                           TypeError, ValueError, TransmissionError,
-                          BrokenPipeError, StreamLenError) as exc:
+                          BrokenPipeError, StreamLenError,
+                          VersionMismatchError) as exc:
             if isinstance(exc, AttributeError):
                 self.signal_error('Unknown request type received from '
                                   'GPG Remote client', logging.error)
@@ -1205,6 +1225,11 @@ class Handler(BaseRequestHandler):
                                   format(exc.args[0],
                                          CONFIG['size_limit']),
                                   logging.info, exit_code=1)
+            elif isinstance(exc, VersionMismatchError):
+                # This error is logged locally only as sending it back
+                # would couse the same error on the other end.
+                self.log('Request version mismatch: server {}, client {}'.
+                         format(__version__, exc.args[0]), logging.error)
         finally:
             # Properly clean up temporary directory.
             try:
@@ -1234,7 +1259,7 @@ if __name__ == '__main__':
 
     # Initialize server configuration: read config file, update config
     # from invocation arguments.
-    update_config(CONFIG['config_path'])
+    update_config(CONFIG['config_path'], CONFIG)
     process_options()
 
     # Initialize logging facility.

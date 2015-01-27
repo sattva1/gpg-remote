@@ -55,6 +55,10 @@ class PackageError(GPGRemoteException):
     pass
 
 
+class VersionMismatchError(GPGRemoteException):
+    pass
+
+
 class FileSystemError(GPGRemoteException):
     pass
 
@@ -70,17 +74,18 @@ class ResponseError(GPGRemoteException):
 # This section is identical for both client and server but duplicated
 # in order to keep modules self-contained.
 
-def update_config(path, silent=True):
+def update_config(path, storage, silent=True):
     """ Update application configuration from the conf file (if exists).
 
         The function attempts to read the conf file at provided path, and
-        update CONFIG dict with its parsed contents. The format for the
-        configuration file is "key = value" for str value, or "key" for
-        bool values; blank lines and lines starting with hash sign are
+        update configuration dict with its parsed contents. The format for
+        the configuration file is "key = value" for str/int value, or "key"
+        for bool values; blank lines and lines starting with hash sign are
         ignored.
 
         Args:
             path (str): Configuration file pathname.
+            storage (dict): Configuration storage to update in-place.
             silent (bool): Supress any errors.
 
         Raises:
@@ -94,7 +99,12 @@ def update_config(path, silent=True):
                 if line.startswith('#') or not line:
                     continue
                 key, separator, value = line.partition('=')
-                CONFIG[key.strip()] = value.strip() if separator else True
+                key, value = key.strip(), value.strip()
+
+                if value.isdecimal():
+                    storage[key] = int(value)
+                else:
+                    storage[key] = value if separator else True
     except:
         if silent:
             return
@@ -117,7 +127,7 @@ def pack(identifier, *fields, files=None):
 
         The package is a structure of the following format:
 
-        header|JSON(identifier, fields, files_meta)|binary,
+        header|JSON(version, identifier, fields, files_meta)|binary,
 
         where header is a 64-bit (8 bytes) JSON packet length header, and
         binary is a concatenated binary data of all included files.
@@ -129,7 +139,7 @@ def pack(identifier, *fields, files=None):
     files = files or {}
 
     files_meta = [(name, len(data)) for name, data in files.items()]
-    package = json.dumps([identifier, fields, files_meta],
+    package = json.dumps([__version__, identifier, fields, files_meta],
                          ensure_ascii=False, separators=(',', ':')).encode()
 
     # Writing header.
@@ -157,16 +167,23 @@ def unpack(package):
 
         Raises:
             PackageError: In case of malformed package.
+            VersionMismatchError: In case the package was created with a
+                different application version. Packer version is passed as
+                exception's first argument.
     """
     try:
         length = int.from_bytes(package.read(HEADER_LEN), 'big')
-        identifier, fields, files_meta = json.loads(
+        version, identifier, fields, files_meta = json.loads(
                                             package.read(length).decode())
-        files = {filename: package.read(length)
-                 for filename, length in files_meta}
-        return identifier, fields, files
+        if version == __version__:
+            files = {filename: package.read(length)
+                     for filename, length in files_meta}
+            return identifier, fields, files
     except:
         raise PackageError
+
+    # Can get here only in case of version mismatch.
+    raise VersionMismatchError(version)
 
 
 def send(length, data, conn, _override_length=None):
@@ -178,7 +195,7 @@ def send(length, data, conn, _override_length=None):
             length (int): Stream length.
             data (io.BytesIO): Data to be sent.
             conn (socket.socket): Connection instance.
-            _override_length (int): Use for debugging only.
+            _override_length (int): For debugging only.
 
         Raises:
             TransmissionError: In case of abruptly terminated connection.
@@ -456,7 +473,7 @@ if __name__ == '__main__':
     # Default conf file is ~/.gnupg/gpgremote_client.conf. Directory can be
     # overridden with GNUPGHOME environment variable.
     conf_path = os.path.join(os.getenv('GNUPGHOME', '~/.gnupg'), CONF_NAME)
-    update_config(conf_path)
+    update_config(conf_path, CONFIG)
 
     args = parse_options(sys.argv[1:])
     stdin = sys.stdin.buffer.read() if not sys.stdin.isatty() else None
@@ -477,7 +494,8 @@ if __name__ == '__main__':
                 error_exit("Unable to access or read file '{}'".
                            format(exc.args[1]))
             elif isinstance(exc, (TransmissionError, ConnectionResetError)):
-                error_exit('Server has abruptly terminated connection')
+                error_exit('Server has abruptly terminated connection '
+                           'while sending request')
             elif isinstance(exc, socket.timeout):
                 error_exit('Timed out while sending request to GPG Remote')
             elif isinstance(exc, BrokenPipeError):
@@ -509,7 +527,8 @@ if __name__ == '__main__':
                            'GPG Remote')
             elif isinstance(exc, (BrokenPipeError, TransmissionError,
                                   ConnectionResetError)):
-                error_exit('Server has abruptly terminated connection')
+                error_exit('Server has abruptly terminated connection '
+                           'while receiving response')
             elif isinstance(exc, FileSystemError):
                 error_exit("Unable to write file '{}'".format(exc.args[1]))
 
