@@ -318,7 +318,5 @@ class TestFlattenArgs(unittest.TestCase):
         self.assertEqual(output, ['--foo', 'param', '--bar', 'arg1'])
 
 
-
-
 if __name__ == '__main__':
     unittest.main()

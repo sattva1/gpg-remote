@@ -65,8 +65,25 @@ to server invocation (-h/--help will print all available options). Most
 server parameters can be reconfigured from the command line as well.
 
 The second part of server configuration is gpg options whitelist defined in
-whitelist.conf in the same directory as server config file. See whitelist
-rules specification in the default whitelist.conf file.
+whitelist.conf in the same directory as server config file. The syntax is
+simple, yet configuring the whitelist correctly is critical to server
+security (see the next section for details).
+
+1. Lines not starting with a dash sign are ignored.
+2. A single set of options per line.
+3. A set is either a single option (in long or short form), or a
+   space-separated long and short forms (in arbitrary amount and order).
+4. Non dash-prefixed words in a set (if any) have special meaning:
+
+    * A bracketed word is considered a wildcard parameter turning options
+      in a set into parameterized ones.
+    * An unbracketed word is a whitelisted parameter value, and, as such,
+      options in a set can be passed with this value only. Multiple
+      whitelisted values must be provided on the same line (quoting /
+      space-escaping is supported).
+    * If a word is bracketed #NO_FILES, it means no files should be
+      expected in arguments list for this options set (see the next
+      section).
 
 
 Security considerations
@@ -81,8 +98,8 @@ are not whitelisted, client user would still be able to add keys to the
 keyring by simply sending them to STDIN (gpg processes it contextually).
 If this should be avoided, it's up to the server administrator to run the
 server as a user without write access to gpg keyring files. Remember that
-default gpg keyrings can be overridden with --secret-keyring and --keyring
-options.
+default gpg keyrings can be overridden with --no-default-keyring,
+--secret-keyring and --keyring options.
 
 Another potential risk to the server is its local files exfiltration. In
 the naive case the user could ask the server to run gpg -o - --enarmor
@@ -198,12 +215,13 @@ ToDo
 Version history
 ---------------
 
-* 2015-01-XX v0.9b2
+* 2015-01-27 v0.9b2
 
   - Fixed "--output -" case.
   - Versioned protocol.
   - Config parser updates.
   - More unittest coverage.
+  - README file updates.
 
 * 2015-01-23 v0.9b1
 
