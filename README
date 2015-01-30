@@ -215,7 +215,12 @@ ToDo
 Version history
 ---------------
 
-* 2015-01-27 v0.9b2
+* 2015-XX-XX - v1.0b1
+
+  - Graceful server shutdown on SIGTERM.
+
+
+* 2015-01-27 - v0.9b2
 
   - Fixed "--output -" case.
   - Versioned protocol.
@@ -223,7 +228,8 @@ Version history
   - More unittest coverage.
   - README file updates.
 
-* 2015-01-23 v0.9b1
+
+* 2015-01-23 - v0.9b1
 
   - First beta release.
 

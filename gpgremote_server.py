@@ -35,14 +35,15 @@
     See README for additional details.
 """
 
-import sys, os, getopt, io, json, shlex, logging, tempfile, threading
+import sys, os, getopt, io, json, shlex, logging, tempfile, \
+    threading, signal
 from socketserver import TCPServer, ThreadingMixIn, BaseRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 from subprocess import Popen, PIPE, DEVNULL, check_output, \
                         TimeoutExpired, CalledProcessError
 
 
-__version__ = '0.9b2'
+__version__ = '1.0b1'
 MIN_PYTHON = (3, 2)
 CONFIG = {
     'host': 'localhost',
@@ -1353,7 +1354,11 @@ if __name__ == '__main__':
                  format(os.getpid(), CONFIG['host'], CONFIG['port']))
 
     try:
-        print('Press Ctrl+C to exit')
+        def sigterm_handler(signum, frame):
+            raise KeyboardInterrupt
+
+        print('Press Ctrl+C or send SIGTERM to exit')
+        signal.signal(signal.SIGTERM, sigterm_handler)
         server.serve_forever()
     except KeyboardInterrupt:
         print('Exiting gracefully')

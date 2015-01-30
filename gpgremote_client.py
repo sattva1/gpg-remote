@@ -25,7 +25,7 @@
 import sys, os, json, io, socket
 
 
-__version__ = '0.9b2'
+__version__ = '1.0b1'
 MIN_PYTHON = (3, 2)
 CONFIG = {
     'host': 'localhost',
