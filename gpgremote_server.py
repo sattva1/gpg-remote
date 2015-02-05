@@ -36,7 +36,7 @@
 """
 
 import sys, os, getopt, io, json, shlex, logging, tempfile, \
-    threading, signal
+    threading, signal, time, socket, array
 from socketserver import TCPServer, ThreadingMixIn, BaseRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 from subprocess import Popen, PIPE, DEVNULL, check_output, \
@@ -49,7 +49,7 @@ CONFIG = {
     'host': 'localhost',
     'port': 29797,
     'conn_timeout': 15,
-    'gpg_timeout': 30,
+    'gpg_timeout': 300,
     'threads': 2,
     'queue': 4,
     'size_limit': 2 ** 30 * 1,  # 1 GiB
@@ -65,6 +65,8 @@ CONFIG = {
     'verbosity': 'error',
     'debug': False}
 TEMP_PREFIX = 'gpgremote_'
+IPC_SOCKET = 'pinentry.socket'
+IPC_POLL = 0.2
 PACKAGE_ERROR = 'error'
 PACKAGE_GPG = 'gpg'
 OUTPUT_OPTS = ['-o', '--output']
@@ -780,7 +782,7 @@ def keyrings_writeable(gpg_argv):
 def error_exit(message, code=1, log_level=None):
     """Print error message (or log with provided logging method), and
     send exit code. Should be used outside of request handler only (see
-    Handler.signal_error() for the other case)."""
+    Handler.send_error() for the other case)."""
     if not log_level:
         print(message)
     else:
@@ -790,15 +792,75 @@ def error_exit(message, code=1, log_level=None):
     sys.exit(code)
 
 
+def log(message, log_level):
+    """ Log a message with thread name included. For the main thread only
+    the message text is being logged.
+
+        Args:
+            message (str): Message to log.
+            log_level (function): Logging severity level method, e.g.
+                logging.error.
+    """
+    thread = threading.current_thread().name
+    log_level('{}: {}'.format(thread, message) if thread else message)
+
+
+def send_socket(socket_file, socket_descriptor, stop):
+    """ Background task to send client socket descriptor to a pinentry
+    process listening on an IPC socket.
+
+        Args:
+            socket_file (str): IPC UNIX socket filepath.
+            socket_descriptor (socket.socket): Opened TCP socket instance.
+            stop (threading.Event): Stop IPC thread flag.
+    """
+    wait = IPC_POLL
+    waiting = 0
+    # Compare timestamp in order to send IPC data only once per IPC socket.
+    ipc_timestamp = None
+
+    while waiting < CONFIG['gpg_timeout']:
+        waiting += wait
+        time.sleep(wait)
+
+        if stop.is_set():
+            break
+
+        if not os.path.exists(socket_file):
+            continue
+        socket_timestamp = os.stat(socket_file).st_ctime
+        if socket_timestamp == ipc_timestamp:
+            continue
+        else:
+            ipc_timestamp = socket_timestamp
+
+        try:
+            sock = socket.socket(socket.AF_UNIX,
+                                 socket.SOCK_STREAM)
+            sock.connect(socket_file)
+            log('IPC connection established, passing socket descriptor',
+                logging.debug)
+            sock.sendmsg([b'client_socket'],
+                         [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                           array.array("i", [socket_descriptor.fileno()]))])
+            log('IPC data sent successfully', logging.debug)
+        except:
+            log('IPC connection or data transmission failed', logging.debug)
+        finally:
+            try:
+                sock.close()
+            except:
+                pass
+
+
 class ThreadingPoolMixIn(ThreadingMixIn):
     """ThreadingMixIn replacement with threads pool support."""
 
     def process_request(self, request, client_address):
-        """Submit request to the concurrency pool."""
-        # Register request in the server queue. Unregistering happens
-        # in Handler.finish().
+        """Submit request to the concurrency pool and register it in the
+        server queue. Unregistering happens in Handler.finish()."""
         self.queue_len += 1
-        logging.debug('Request registered in the queue')
+        log('Request registered in the queue', logging.debug)
 
         self.pool.submit(self.process_request_thread,
                          request, client_address)
@@ -828,7 +890,7 @@ class Server(ThreadingPoolMixIn, TCPServer):
         allowed = not self.request_queue_size \
                             or self.queue_len < self.request_queue_size
         if not allowed:
-            logging.info('Queue overflow, request handling denied')
+            log('Queue overflow, request handling denied', logging.info)
             # Signalling an error to the client using low-level interface.
             message = 'GPG Remote Server: Connection refused. ' \
                                             'Too many requests'
@@ -862,19 +924,7 @@ class Handler(BaseRequestHandler):
     files_received = None
     no_files = False
 
-    def log(self, message, log_level):
-        """ Log a message with thread name included.
-
-            Args:
-                message (str): Message to log.
-                log_level (function): Logging severity level method, e.g.
-                    logging.error.
-        """
-        thread = threading.current_thread().name
-        log_level('{}: {}'.format(thread, message))
-
-    def signal_error(self, message, log_level=None, exit_code=1,
-                     _conn=None):
+    def send_error(self, message, log_level=None, exit_code=1, _conn=None):
         """ Log an error message and send it back to the client along with
         exit code.
 
@@ -887,7 +937,7 @@ class Handler(BaseRequestHandler):
                     overridden.
         """
         if log_level:
-            self.log(message, log_level)
+            log(message, log_level)
         message = 'GPG Remote Server: ' + message
         length, package = pack(PACKAGE_ERROR, message, exit_code)
         send(length, package, _conn or self.request)
@@ -939,10 +989,9 @@ class Handler(BaseRequestHandler):
         # Replacing output filename.
         output_path, output_idx = output_file
         if output_idx is not None and output_path != '-':
-            self.log('Replacing filepath in option {}: {} -> {}'.
-                     format(args[output_idx][0], args[output_idx][1],
-                            self.tempdirs[output_path][1]),
-                     logging.debug)
+            log('Replacing filepath in option {}: {} -> {}'.
+                format(args[output_idx][0], args[output_idx][1],
+                       self.tempdirs[output_path][1]), logging.debug)
             args[output_idx] = (args[output_idx][0],
                                 self.tempdirs[output_path][1])
 
@@ -953,9 +1002,9 @@ class Handler(BaseRequestHandler):
                 continue
             # Filename match. Replacing.
             if param in self.tempdirs:
-                self.log('Replacing filepath in argument: {} -> {}'.
-                         format(args[i][1], self.tempdirs[param][1]),
-                         logging.debug)
+                log('Replacing filepath in argument: {} -> {}'.
+                    format(args[i][1], self.tempdirs[param][1]),
+                    logging.debug)
                 args[i] = (None, self.tempdirs[param][1])
 
         return args
@@ -1019,12 +1068,12 @@ class Handler(BaseRequestHandler):
                     # Trimming to keep memory reqs in bounds.
                     files[filename] = b''
 
-                    self.log('Extracted client file "{}" to "{}"'.
-                             format(filename, filepath), logging.debug)
+                    log('Extracted client file "{}" to "{}"'.
+                        format(filename, filepath), logging.debug)
                 # This is the output file, nothing to write.
                 elif filename != '-':
-                    self.log('Output file "{}" will be saved to "{}"'.
-                             format(filename, filepath), logging.debug)
+                    log('Output file "{}" will be saved to "{}"'.
+                        format(filename, filepath), logging.debug)
 
                 # Caching file metadata.
                 self.tempdirs[filename] = (tempdir, filepath, data is None)
@@ -1064,9 +1113,8 @@ class Handler(BaseRequestHandler):
                 new_temp_filepath = os.path.join(tempdir.name, filename)
                 with open(new_temp_filepath, 'rb') as file:
                     output[new_filepath] = file.read()
-                self.log('Found new file "{}", pass to client as "{}"'.
-                         format(new_temp_filepath, new_filepath),
-                         logging.debug)
+                log('Found new file "{}", pass to client as "{}"'.
+                    format(new_temp_filepath, new_filepath), logging.debug)
 
         return output
 
@@ -1095,46 +1143,81 @@ class Handler(BaseRequestHandler):
             stdin = files.pop(None) if None in files else b''
 
             try:
-                self.log('Received argument tokens: {}'.
-                         format(args), logging.debug)
+                log('Received argument tokens: {}'.format(args),
+                    logging.debug)
                 filtered_args = self.filter_args(args)
-                self.log('Whitelisted argument tokens: {}'.
-                         format(filtered_args), logging.debug)
+                log('Whitelisted argument tokens: {}'.format(filtered_args),
+                    logging.debug)
 
                 if self.no_files:
-                    self.log('Assuming no filenames in command line '
-                             'arguments', logging.debug)
+                    log('Assuming no filenames in command line arguments',
+                        logging.debug)
                     # NB: A necessary step in order to protect server from
                     # accidental information leakage (e.g. gpg -ao - \
                     # -r attackerKey -e /secret/server/file).
                     safe_args = del_options(filtered_args, OUTPUT_OPTS)
                 else:
                     output_file = get_option(filtered_args, OUTPUT_OPTS)
-                    self.log('Defined output file: {}'.
-                             format(output_file[0]), logging.debug)
+                    log('Defined output file: {}'.format(output_file[0]),
+                        logging.debug)
 
                     self.unpack_files(files, output_file)
-                    self.log('Total files unpacked: {}'.
-                             format(self.files_received), logging.debug)
+                    log('Total files unpacked: {}'.
+                        format(self.files_received), logging.debug)
 
                     safe_args = self.replace_args_filepaths(filtered_args,
                                                             output_file)
 
                 gpg_argv = self.gpg_argv + flatten_args(safe_args)
-                self.log('Invoking GPG process with shell tokens: {}'.
-                         format(gpg_argv), logging.info)
+                log('Invoking GPG process with shell tokens: {}'.
+                    format(gpg_argv), logging.info)
 
+                # Opportunistically pass socket descriptor to the custom
+                # pinentry application. For a standard pinentry this should
+                # have no effect, i.e. nothing will be sent.
+                socket_dir = tempfile.mkdtemp(dir=CONFIG['tempdir'],
+                                              prefix=TEMP_PREFIX)
+                socket_file = os.path.join(socket_dir, IPC_SOCKET)
+                log('Expecting pinentry IPC socket as "{}" file'.
+                    format(socket_file), logging.debug)
+                stop_ipc = threading.Event()
+                ipc_thread = threading.Thread(target=send_socket,
+                                              args=(socket_file,
+                                                    self.request,
+                                                    stop_ipc))
+                ipc_thread.daemon = True
+                ipc_thread.start()
+                log('IPC thread started as {}'.format(ipc_thread.name),
+                    logging.debug)
+
+                # Update environment with pinentry IPC data consisting of
+                # 5 colon-separated elements: application version, path to
+                # IPC socket, GPG timeout value, path to gpg-remote server
+                # directory and gpg-remote server module name. The two last
+                # elements will be used to import data transmission
+                # functions from the current module.
+                module_path = os.path.split(os.path.abspath(__file__))
+                module_dir = module_path[0]
+                module_name = os.path.splitext(module_path[1])[0]
+                env = os.environ.copy()
+                env['PINENTRY_USER_DATA'] = ':'.join([
+                                                __version__, socket_file,
+                                                str(CONFIG['gpg_timeout']),
+                                                module_dir, module_name])
+
+                # Call gpg.
                 with Popen(gpg_argv, stdin=PIPE, stdout=PIPE, stderr=PIPE,
-                           cwd=self.cwd.name) as gpg:
+                           cwd=self.cwd.name, env=env) as gpg:
                     if stdin:
-                        self.log('Passing {} bytes to GPG process STDIN'.
-                                 format(len(stdin)), logging.debug)
+                        log('Passing {} bytes to GPG process STDIN'.
+                            format(len(stdin)), logging.debug)
                     stdout, stderr = gpg.communicate(stdin,
                                     timeout=float(CONFIG['gpg_timeout']))
                     exit_code = gpg.returncode
-                    self.log('GPG process terminated with exit code {}'.
-                             format(exit_code), logging.info)
+                    log('GPG process terminated with exit code {}'.
+                        format(exit_code), logging.info)
 
+                # Collect new files.
                 if self.no_files:
                     # NB: A necessary step in order to protect server from
                     # accidental information leakage (e.g. gpg -ao ~/foo \
@@ -1142,64 +1225,75 @@ class Handler(BaseRequestHandler):
                     out_files = {}
                 else:
                     out_files = self.pack_files()
-                    self.log('Total new files collected: {}'.
-                             format(len(out_files)), logging.debug)
+                    log('Total new files collected: {}'.
+                        format(len(out_files)), logging.debug)
 
+                # Send response.
                 out_files[None] = stdout
                 length, package = pack(PACKAGE_GPG,
                                        stderr.decode(errors='ignore'),
                                        exit_code, files=out_files)
                 send(length, package, self.request)
-                self.log('Response package sent successfully',
-                         logging.debug)
+                log('Response package sent successfully', logging.debug)
 
             except handle_exc(RestrictedError, AmbiguousError,
                               MalformedArgsError, FilePackageError,
                               PackageError, TimeoutExpired) as exc:
                 if isinstance(exc, RestrictedError):
-                    self.signal_error('Cannot invoke GPG with restricted '
-                                      'option/parameter: {}'.
-                                      format(exc.args[0]),
-                                      logging.info, exit_code=2)
+                    self.send_error('Cannot invoke GPG with restricted '
+                                    'option/parameter: {}'.
+                                    format(exc.args[0]),
+                                    logging.info, exit_code=2)
                 elif isinstance(exc, AmbiguousError):
-                    self.signal_error('Ambiguous option: {}'.
-                                      format(exc.args[0]),
-                                      logging.debug, exit_code=2)
+                    self.send_error('Ambiguous option: {}'.
+                                    format(exc.args[0]),
+                                    logging.debug, exit_code=2)
                 elif isinstance(exc, MalformedArgsError):
-                    self.signal_error('Malformed option: {}'.
-                                      format(exc.args[0]),
-                                      logging.error, exit_code=2)
+                    self.send_error('Malformed option: {}'.
+                                    format(exc.args[0]),
+                                    logging.error, exit_code=2)
                 elif isinstance(exc, FilePackageError):
-                    self.signal_error('Unable to unpack file data: {}'.
-                                      format(exc.args[0]),
-                                      logging.error, exit_code=2)
+                    self.send_error('Unable to unpack file data: {}'.
+                                    format(exc.args[0]),
+                                    logging.error, exit_code=2)
                 elif isinstance(exc, PackageError):
-                    self.signal_error('General package error',
-                                      logging.error, exit_code=1)
+                    self.send_error('General package error. Probably the '
+                                    'amount of files received does not '
+                                    'match the expected number',
+                                    logging.error, exit_code=1)
                 elif isinstance(exc, TimeoutExpired):
                     try:
                         gpg.kill()
                     except:
                         pass
-                    self.signal_error('GPG process timed out',
-                                      logging.error, exit_code=1)
+                    self.send_error('GPG process timed out',
+                                    logging.error, exit_code=1)
+            finally:
+                try:
+                    stop_ipc.set()
+                    ipc_thread.join(IPC_POLL)
+                    log('IPC thread stopped', logging.debug)
+                    if os.path.exists(socket_file):
+                        os.remove(socket_file)
+                    os.rmdir(socket_dir)
+                except:
+                    pass
         except handle_exc(TypeError, ValueError, AttributeError) as exc:
             raise RequestError
 
     def handle(self):
         """Dispatch client's request."""
         try:
-            self.log('Begin request handling', logging.info)
+            log('Begin request handling', logging.info)
             identifier, *request = unpack(receive(self.request,
                                     len_limit=int(CONFIG['size_limit'])))
             handle_request = getattr(self, 'handle_request_' + identifier)
-            self.log('Package "{}" received'.format(identifier),
-                     logging.debug)
+            log('Package "{}" received'.format(identifier), logging.debug)
 
             self.cwd = tempfile.TemporaryDirectory(dir=CONFIG['tempdir'],
                                                    prefix=TEMP_PREFIX)
-            self.log('Created GPG working dir "{}"'.format(self.cwd.name),
-                     logging.debug)
+            log('Created GPG working dir "{}"'.format(self.cwd.name),
+                logging.debug)
 
             handle_request(*request)
 
@@ -1208,49 +1302,48 @@ class Handler(BaseRequestHandler):
                           BrokenPipeError, StreamLenError,
                           VersionMismatchError) as exc:
             if isinstance(exc, AttributeError):
-                self.signal_error('Unknown request type received from '
-                                  'GPG Remote client', logging.error)
+                self.send_error('Unknown request type received from '
+                                'GPG Remote client', logging.error)
             elif isinstance(exc, RequestError):
-                self.signal_error('Malformed request received from '
-                                  'GPG Remote client', logging.error)
+                self.send_error('Malformed request received from '
+                                'GPG Remote client', logging.error)
             elif isinstance(exc, (TypeError, ValueError)):
-                self.signal_error('Unable to unpack GPG Remote '
-                                  'client request', logging.error)
+                self.send_error('Unable to unpack GPG Remote '
+                                'client request', logging.error)
             elif isinstance(exc, TransmissionError):
-                self.log('Client has abruptly terminated transmission',
-                         logging.error)
+                log('Client has abruptly terminated transmission',
+                    logging.error)
             elif isinstance(exc, BrokenPipeError):
-                self.log('Client has broken connection', logging.debug)
+                log('Client has broken connection', logging.debug)
             elif isinstance(exc, StreamLenError):
-                self.signal_error('Input size exceeded (bytes): {} > {}'.
-                                  format(exc.args[0],
-                                         CONFIG['size_limit']),
-                                  logging.info, exit_code=1)
+                self.send_error('Input size exceeded (bytes): {} > {}'.
+                                format(exc.args[0], CONFIG['size_limit']),
+                                logging.info, exit_code=1)
             elif isinstance(exc, VersionMismatchError):
                 # This error is logged locally only as sending it back
                 # would couse the same error on the other end.
-                self.log('Request version mismatch: server {}, client {}'.
-                         format(__version__, exc.args[0]), logging.error)
+                log('Request version mismatch: server {}, client {}'.
+                    format(__version__, exc.args[0]), logging.error)
         finally:
             # Properly clean up temporary directory.
             try:
                 for tempdir, _, _ in self.tempdirs.values():
-                    self.log('Removing temporary dir "{}"'.
-                             format(tempdir.name), logging.debug)
+                    log('Removing temporary dir "{}"'.format(tempdir.name),
+                        logging.debug)
                     tempdir.cleanup()
 
-                self.log('Removing gpg working dir "{}"'.
-                     format(self.cwd.name), logging.debug)
+                log('Removing gpg working dir "{}"'.format(self.cwd.name),
+                    logging.debug)
                 self.cwd.cleanup()
             except AttributeError:
                 pass
-            self.log('End request handling', logging.info)
+            log('End request handling', logging.info)
 
     def finish(self):
         """Unregister request from the server queue."""
         self.server.queue_len -= 1
-        logging.debug('Request unregistered from the queue, {} left'.
-                      format(self.server.queue_len))
+        log('Request unregistered from the queue, {} left'.
+            format(self.server.queue_len), logging.debug)
 
 
 if __name__ == '__main__':
@@ -1264,6 +1357,7 @@ if __name__ == '__main__':
     process_options()
 
     # Initialize logging facility.
+    threading.current_thread().name = ''
     log_level = getattr(logging, CONFIG['verbosity'].upper(), None)
     if not isinstance(log_level, int):
         print('invalid verbosity level "{}"'.format(CONFIG['verbosity']))
@@ -1284,23 +1378,23 @@ if __name__ == '__main__':
     try:
         with open(whitelist_path, 'r') as file:
             Handler.whitelist = parse_whitelist(file.readlines())
-            logging.info('Parsed whitelist file "{}"'.
-                         format(whitelist_path))
-            logging.debug('Total options whitelisted: {}'.
-                          format(len(Handler.whitelist)))
+            log('Parsed whitelist file "{}"'.format(whitelist_path),
+                logging.info)
+            log('Total options whitelisted: {}'.
+                format(len(Handler.whitelist)), logging.debug)
     except:
         error_exit('Unable to read or parse whitelist file "{}"'.
                    format(whitelist_path), log_level=logging.critical)
 
     Handler.gpg_argv = shlex.split(CONFIG['gpg_exec'])
-    logging.debug('Default GPG invocation tokens: {}'.
-                  format(Handler.gpg_argv))
+    log('Default GPG invocation tokens: {}'.format(Handler.gpg_argv),
+        logging.debug)
 
     if not CONFIG['unsafe']:
         try:
             writeable, keyrings = keyrings_writeable(Handler.gpg_argv)
-            logging.info('GPG keyrings checked for write access: {}'.
-                         format(', '.join(keyrings)))
+            log('GPG keyrings checked for write access: {}'.
+                format(', '.join(keyrings)), logging.info)
             if writeable:
                 error_exit('The current user has write access to some of '
                            'GPG keyrings. GPG Remote Server cannot protect '
@@ -1309,36 +1403,36 @@ if __name__ == '__main__':
                            'read-only, or start the server with --unsafe '
                            'option', log_level=logging.critical)
             else:
-                logging.info('Checked keyrings are read-only for the '
-                             'current user. Note: This check cannot '
-                             'detect empty keyrings. Make sure no empty '
-                             'keyring files are defined in gpg '
-                             'configuration or invocation options')
+                log('Checked keyrings are read-only for the current user. '
+                    'Note: This check cannot detect empty keyrings. Make '
+                    'sure no empty keyring files are defined in gpg '
+                    'configuration or invocation options', logging.info)
         except FileNotFoundError:
             error_exit('GPG executable "{}" not found'.
                        format(Handler.gpg_argv[0]),
                        log_level=logging.critical)
     else:
-        logging.critical('Safety checks disabled')
+        log('Safety checks disabled', logging.critical)
 
     if int(CONFIG['queue']) \
                         and int(CONFIG['queue']) < int(CONFIG['threads']):
         error_exit('Queue size value cannot be less the number '
                    'of threads', log_level=logging.critical)
 
-    logging.info('Strict mode {}'.format('enabled' if CONFIG['strict']
-                                         else 'disabled'))
-    logging.info('Connection timeout (sec): {}'.format(
-                                                    CONFIG['conn_timeout']))
-    logging.info('GPG process timeout (sec): {}'.format(
-                                                    CONFIG['gpg_timeout']))
-    logging.info('Package size limit (bytes): {}'.format(
-                                                    CONFIG['size_limit']))
-    logging.info('Threads: {}'.format(CONFIG['threads']))
-    logging.info('Queue size: {}'.format(CONFIG['queue'] or 'unlimited'))
+    log('Strict mode {}'.format('enabled' if CONFIG['strict']
+                                else 'disabled'), logging.info)
+    log('Connection timeout (sec): {}'.format(CONFIG['conn_timeout']),
+        logging.info)
+    log('GPG process timeout (sec): {}'.format(CONFIG['gpg_timeout']),
+        logging.info)
+    log('Package size limit (bytes): {}'.format(CONFIG['size_limit']),
+        logging.info)
+    log('Threads: {}'.format(CONFIG['threads']), logging.info)
+    log('Queue size: {}'.format(CONFIG['queue'] or 'unlimited'),
+        logging.info)
 
     if CONFIG['debug']:
-        logging.critical('RUNNING IN DEBUG MODE')
+        log('RUNNING IN DEBUG MODE', logging.critical)
 
     try:
         Server.pool = ThreadPoolExecutor(max_workers=int(CONFIG['threads']))
@@ -1350,8 +1444,8 @@ if __name__ == '__main__':
         error_exit('Listening address:port already in use',
                    log_level=logging.critical)
 
-    logging.info('Server started as PID {}. Listening on {}:{}'.
-                 format(os.getpid(), CONFIG['host'], CONFIG['port']))
+    log('Server started as PID {}. Listening on {}:{}'.
+        format(os.getpid(), CONFIG['host'], CONFIG['port']), logging.info)
 
     try:
         def sigterm_handler(signum, frame):
@@ -1364,5 +1458,5 @@ if __name__ == '__main__':
         print('Exiting gracefully')
         server.socket.close()
         server.shutdown()
-        logging.info('Server stopped by the user')
+        log('Server stopped by the user', logging.info)
         print()

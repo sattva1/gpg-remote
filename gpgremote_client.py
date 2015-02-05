@@ -22,7 +22,7 @@
     See README for additional details.
 """
 
-import sys, os, json, io, socket
+import sys, os, json, io, socket, signal
 
 
 __version__ = '1.0b1'
@@ -30,10 +30,13 @@ MIN_PYTHON = (3, 2)
 CONFIG = {
     'host': 'localhost',
     'port': 29797,
-    'conn_timeout': 60}
+    'conn_timeout': 310}
 CONF_NAME = 'gpgremote_client.conf'
 PACKAGE_ERROR = 'error'
 PACKAGE_GPG = 'gpg'
+PACKAGE_PIN = 'pin'
+STAGE_REQUEST = 'request'
+STAGE_RESPONSE = 'response'
 OUTPUT_OPTS = ['-o', '--output']
 CONN_BUF = 4096
 HEADER_LEN = 8
@@ -64,6 +67,10 @@ class FileSystemError(GPGRemoteException):
 
 
 class ResponseError(GPGRemoteException):
+    pass
+
+
+class PyassuanImportError(GPGRemoteException):
     pass
 
 
@@ -366,103 +373,347 @@ def get_filenames(args):
             and param and os.path.isfile(param)]
 
 
-def send_request_gpg(args, stdin, filenames, conn):
-    """ Generate and send request package for GPG execution.
-
-        Args:
-            args (list): Parsed command line arguments (output of
-                parse_options() function).
-            stdin (bytes): STDIN data.
-            filenames (list): Filenames of existing files in command line
-                arguments (as per get_filenames() function).
-            conn (socket.socket): Connection instance.
-
-        Raises:
-            FileSystemError: In case of errors from the file system layer
-                during files packing. The filename is passed as the first
-                argument.
-            TransmissionError: Passed unhandled from the lower level.
-            socket.timeout: Passed unhandled from the lower level.
-    """
-    files = {}
-    for filename in filenames:
-        try:
-            with open(filename, 'rb') as file:
-                files[filename] = file.read()
-        except:
-            raise FileSystemError(filename)
-
-    # Adding STDIN binary stream as None-keyed file.
-    if stdin is not None:
-        files[None] = stdin
-
-    length, package = pack(PACKAGE_GPG, *args, files=files)
-    send(length, package, conn)
-
-
-def handle_response_gpg(*data):
-    """ Process 'gpg' type response package.
-
-        Args:
-            data (list): Package contents returned by unpack() with
-                identifier element discarded. Packed fields are assumed
-                to be a list of [stderr, exit_code]. All GPG-generated
-                files are passed as the corresponding data element (see
-                unpack() for details) with the None-keyed element being
-                STDOUT binary stream. Files are written to the specified
-                filenames.
-
-        Raises:
-            ResponseError: In case of malformed package.
-            FileSystemError: In case any output file cannot be written.
-                File name is passed as exception's first argument.
-    """
-    try:
-        fields, files = data
-        stderr, exit_code = fields
-
-        # Writing output files. At the very least STDOUT should be
-        # contained here.
-        try:
-            for filename, data in files.items():
-                if filename is not None:
-                    with open(filename, 'wb') as file:
-                        file.write(data)
-                else:
-                    stdout = data
-        except:
-            raise FileSystemError(filename)
-        # Writing STDERR/STDOUT, sending exit code.
-        sys.stderr.write(stderr)
-        sys.stdout.buffer.write(stdout)
-        sys.exit(exit_code)
-    except (TypeError, ValueError):
-        raise ResponseError
-
-
-def handle_response_error(*data):
-    """ Process 'error' type response package.
-
-        Args:
-            data (list): Package contents returned by unpack() with
-                identifier element discarded. Packed fields are assumed
-                to be a list of [message, exit_code].
-
-        Raises:
-            ResponseError: In case of malformed package.
-    """
-    try:
-        fields, _ = data
-        message, code = fields
-        error_exit(message, code)
-    except (TypeError, ValueError):
-        raise ResponseError
-
-
 def error_exit(msg, code=1):
     """Print error message and send exit code."""
     print(msg)
     sys.exit(code)
+
+
+class ErrorHandler(object):
+    """ Exceptions handler.
+
+        A handler method must conform to "handle_<stage>_<exc_name>" naming
+        template and accept the actual exception as the only argument.
+
+        Attributes:
+            stage (str): STAGE_* constant corresponding to the current
+                protocol stage.
+    """
+
+    stage = None
+
+    def __init__(self, stage):
+        self.stage = stage
+
+    def __call__(self, exc):
+        """Handle exception."""
+        name = exc.__class__.__name__
+        try:
+            handle_error = getattr(self, 'handle_{}_{}'.format(self.stage,
+                                                               name))
+        except AttributeError:
+            import traceback
+
+            error_exit("Undefined error '{}' at {} stage:\n{}".
+                       format(name, self.stage,
+                              traceback.format_exc().rstrip()))
+        handle_error(exc)
+
+    def handle_request_FileSystemError(self, exc):
+        error_exit("Unable to access or read file '{}'".format(exc.args[1]))
+
+    def handle_response_FileSystemError(self, exc):
+        error_exit("Unable to write file '{}'".format(exc.args[1]))
+
+    def handle_request_TransmissionError(self, exc):
+        error_exit('Server has abruptly terminated connection while '
+                   'sending request')
+
+    def handle_response_TransmissionError(self, exc):
+        error_exit('Server has abruptly terminated connection while '
+                   'receiving response')
+
+    def handle_request_ConnectionResetError(self, exc):
+        self.handle_request_TransmissionError()
+
+    def handle_response_ConnectionResetError(self, exc):
+        self.handle_response_TransmissionError()
+
+    def handle_request_timeout(self, exc):
+        error_exit('Timed out while sending request to GPG Remote')
+
+    def handle_response_timeout(self, exc):
+        error_exit('Timed out while awaiting response from GPG Remote')
+
+    def handle_request_BrokenPipeError(self, exc):
+        # Optimistically ignore exception to later read from
+        # socket as server may have sent a reason for connection
+        # termination.
+        return
+
+    def handle_response_BrokenPipeError(self, exc):
+        self.handle_response_TransmissionError()
+
+    def handle_response_AttributeError(self, exc):
+        error_exit('Unknown type response received from GPG Remote Server')
+
+    def handle_response_ResponseError(self, exc):
+        error_exit('Malformed response received from GPG Remote Server')
+
+    def handle_response_PackageError(self, exc):
+        self.handle_response_ResponseError()
+
+    def handle_response_TypeError(self, exc):
+        error_exit('Unable to unpack GPG Remote Server response')
+
+    def handle_response_ValueError(self, exc):
+        self.handle_response_TypeError()
+
+    def handle_response_PyassuanImportError(self, exc):
+        error_exit('Error importing pyassuan library. Make sure the '
+                   'library is installed')
+
+
+class PackageHandler(object):
+    """ Packages dispatcher/handler.
+
+        The dispatcher is a simple single-threaded server listening on the
+        provided connection. Once a package is received, it gets passed to
+        the corresponding handler method. The server runs until its 'stop'
+        attribute is set to True, or until a handler terminates the
+        interpreter by calling sys.exit().
+
+        Attributes:
+            stop (bool): Stop execution flag. If set to True the dispatcher
+                will stop listening for new packages once the current
+                handler has finished.
+            conn (socket.socket): Server connection instance.
+            conn_timeout (int): Connection timeout interval (in seconds).
+    """
+
+    def __init__(self, conn):
+        """ Server initialization.
+
+            Args:
+                conn (socket.socket): Server connection instance.
+        """
+        self.stop = False
+        self.conn = conn
+        self.conn_timeout = int(CONFIG['conn_timeout'])
+
+    @staticmethod
+    def timeout(signum, frame):
+        """Timeout signal. Raises socket.timeout exception."""
+        raise socket.timeout
+
+    def run(self):
+        """ Start dispatcher.
+
+            Raises:
+                AttributeError: In case of an unknown package type.
+        """
+        signal.signal(signal.SIGALRM, self.timeout)
+        signal.alarm(self.conn_timeout)
+
+        while not self.stop:
+            ErrorHandler.stage = STAGE_RESPONSE
+            identifier, *response = unpack(receive(self.conn))
+            handle_package = getattr(self, 'handle_package_' + identifier)
+            handle_package(*response)
+
+        signal.alarm(0)
+
+    def send_package_gpg(self, args, stdin, filenames):
+        """ Generate and send request package for GPG execution.
+
+            Args:
+                args (list): Parsed command line arguments (output of
+                    parse_options() function).
+                stdin (bytes): STDIN data.
+                filenames (list): Filenames of existing files in command
+                    line arguments (as per get_filenames() function).
+
+            Raises:
+                FileSystemError: In case of errors from the file system
+                    layer during files packing. The filename is passed as
+                    the first argument.
+                TransmissionError: Passed unhandled from the lower level.
+                socket.timeout: Passed unhandled from the lower level.
+        """
+        ErrorHandler.stage = STAGE_REQUEST
+        files = {}
+        for filename in filenames:
+            try:
+                with open(filename, 'rb') as file:
+                    files[filename] = file.read()
+            except:
+                raise FileSystemError(filename)
+
+        # Adding STDIN binary stream as None-keyed file.
+        if stdin is not None:
+            files[None] = stdin
+
+        length, package = pack(PACKAGE_GPG, *args, files=files)
+        send(length, package, self.conn)
+
+    def send_package_pin(self, responses):
+        """ Prepare and send pinentry output data.
+
+            Args:
+                responses (list): A list of pyassuan response objects.
+
+            Raises:
+                TransmissionError: Passed unhandled from the lower level.
+                socket.timeout: Passed unhandled from the lower level.
+        """
+        import base64
+
+        ErrorHandler.stage = STAGE_REQUEST
+        data = []
+        for response in responses:
+            command = response.type
+            param = response.parameters
+            param = base64.b64encode(param if isinstance(param, bytes)
+                                     else param.encode()).decode() \
+                    if param is not None and command != 'ERR' else param
+            data.append((command, param))
+
+        length, package = pack(PACKAGE_PIN, *data)
+        send(length, package, self.conn)
+
+    def handle_package_gpg(self, *data):
+        """ Process 'gpg' type response package.
+
+            Args:
+                data (list): Package contents returned by unpack() with
+                    identifier element discarded. Packed fields are assumed
+                    to be a list of [stderr, exit_code]. All GPG-generated
+                    files are passed as the corresponding data element (see
+                    unpack() for details) with the None-keyed element being
+                    STDOUT binary stream. Files are written to the
+                    specified filenames.
+
+            Raises:
+                ResponseError: In case of malformed package.
+                FileSystemError: In case any output file cannot be written.
+                    File name is passed as exception's first argument.
+        """
+        self.stop = True
+        try:
+            fields, files = data
+            stderr, exit_code = fields
+
+            # Writing output files. At the very least STDOUT should be
+            # contained here.
+            try:
+                for filename, data in files.items():
+                    if filename is not None:
+                        with open(filename, 'wb') as file:
+                            file.write(data)
+                    else:
+                        stdout = data
+            except:
+                raise FileSystemError(filename)
+            # Writing STDERR/STDOUT, sending exit code.
+            sys.stderr.write(stderr)
+            sys.stdout.buffer.write(stdout)
+            sys.exit(exit_code)
+        except (TypeError, ValueError):
+            raise ResponseError
+
+    def handle_package_pin(self, *data):
+        """ Process 'pin' type response package. (Technically, it is
+        a request from the remote pinentry but backwards-named for
+        consistency reasons.)
+
+            The method does not returns, instead it sends pinentry response
+            back to the server.
+
+            Args:
+                data (list): Package contents returned by unpack() with
+                    identifier element discarded. Packed fields are assumed
+                    to be a list of [strings, options], both of which are
+                    lists of two-tuples.
+
+            Raises:
+                PyassuanImportError: If pyassuan library is not installed.
+        """
+        # Expect server data to be format conformant, so not handle errors.
+        fields, _ = data
+        strings, options = fields
+
+        # Update description string.
+        for i, element in enumerate(strings):
+            if element[0] == 'SETDESC':
+                strings[i] = (element[0],
+                              'GPG Remote Server:\n' + element[1])
+        # Update ttyname option.
+        for i, element in enumerate(options):
+            if element[1] is not None and element[1].startswith('ttyname='):
+                ttyname = os.ttyname(sys.stdin.fileno())
+                options[i] = (element[0], 'ttyname=' + ttyname)
+
+        response = self._get_pin(options, strings)
+        self.send_package_pin(response)
+
+    def _get_pin(self, options, strings):
+        """ Run pinentry and ask for client passphrase.
+
+            Args:
+                options (list): List of Assuan options two-tuples.
+                strings (list): List of Assuan text strings two-tuples.
+
+            Returns:
+                (list) List of pyassuan response objects.
+
+            Raises:
+                PyassuanImportError: If pyassuan library is not installed.
+        """
+        try:
+            from pyassuan import client as assuan_client
+            from pyassuan import common as assuan_common
+            from pyassuan import error as assuan_error
+        except ImportError:
+            raise PyassuanImportError
+        from subprocess import Popen, PIPE
+
+        client = assuan_client.AssuanClient(name='pin_client',
+                                            close_on_disconnect=True)
+
+        try:
+            with Popen(['pinentry'], stdin=PIPE, stdout=PIPE) as pinentry:
+                client.input = pinentry.stdout
+                client.output = pinentry.stdin
+                client.connect()
+
+                try:
+                    if client.read_response().type != 'OK':
+                        error_exit('Pinentry protocol failed')
+                    for opt, param in options:
+                        client.make_request(assuan_common.Request(opt,
+                                                                  param))
+                    for string, contents in strings:
+                        client.make_request(assuan_common.Request(string,
+                                                                  contents))
+                    return client.make_request(
+                                        assuan_common.Request('GETPIN'))[0]
+                except assuan_error.AssuanError as exc:
+                    return exc.responses
+                finally:
+                    client.make_request(assuan_common.Request('BYE'))
+                    client.disconnect()
+
+        except FileNotFoundError:
+            error_exit('Pinentry program not found')
+
+    def handle_package_error(self, *data):
+        """ Process 'error' type response package.
+
+            Args:
+                data (list): Package contents returned by unpack() with
+                    identifier element discarded. Packed fields are assumed
+                    to be a list of [message, exit_code].
+
+            Raises:
+                ResponseError: In case of malformed package.
+        """
+        self.stop = True
+        try:
+            fields, _ = data
+            message, code = fields
+            error_exit(message, code)
+        except (TypeError, ValueError):
+            raise ResponseError
 
 
 if __name__ == '__main__':
@@ -470,8 +721,6 @@ if __name__ == '__main__':
         error_exit("Python interpreter version {} or higher is required".
                    format('.'.join([str(i) for i in MIN_PYTHON])))
 
-    # Default conf file is ~/.gnupg/gpgremote_client.conf. Directory can be
-    # overridden with GNUPGHOME environment variable.
     conf_path = os.path.join(os.getenv('GNUPGHOME', '~/.gnupg'), CONF_NAME)
     update_config(conf_path, CONFIG)
 
@@ -483,54 +732,26 @@ if __name__ == '__main__':
         conn = socket.create_connection(
                                 (CONFIG['host'], int(CONFIG['port'])),
                                 timeout=float(CONFIG['conn_timeout'] or 1))
+        package_handler = PackageHandler(conn)
+        error_handler = ErrorHandler(STAGE_REQUEST)
 
         # Sending request to the server.
         try:
-            send_request_gpg(args, stdin, filenames, conn)
+            package_handler.send_package_gpg(args, stdin, filenames)
         except (FileSystemError, TransmissionError,
                 socket.timeout, BrokenPipeError,
                 ConnectionResetError) as exc:
-            if isinstance(exc, FileSystemError):
-                error_exit("Unable to access or read file '{}'".
-                           format(exc.args[1]))
-            elif isinstance(exc, (TransmissionError, ConnectionResetError)):
-                error_exit('Server has abruptly terminated connection '
-                           'while sending request')
-            elif isinstance(exc, socket.timeout):
-                error_exit('Timed out while sending request to GPG Remote')
-            elif isinstance(exc, BrokenPipeError):
-                # Optimistically ignore exception to later read from
-                # socket as server may have sent a reason for connection
-                # termination.
-                pass
+            error_handler(exc)
 
-        # Receiving response from the server.
+        # Handling server response.
         try:
-            identifier, *response = unpack(receive(conn))
-            handle_response = globals()['handle_response_' +
-                                        identifier]
-            handle_response(*response)
-        except (NameError, ResponseError, PackageError,
+            package_handler.run()
+        except (AttributeError, ResponseError, PackageError,
                 TypeError, ValueError, socket.timeout,
                 BrokenPipeError, TransmissionError,
-                ConnectionResetError, FileSystemError) as exc:
-            if isinstance(exc, NameError):
-                error_exit('Unknown type response received from '
-                           'GPG Remote Server')
-            elif isinstance(exc, (ResponseError, PackageError)):
-                error_exit('Malformed response received from '
-                           'GPG Remote Server')
-            elif isinstance(exc, (TypeError, ValueError)):
-                error_exit('Unable to unpack GPG Remote Server response')
-            elif isinstance(exc, socket.timeout):
-                error_exit('Timed out while awaiting response from '
-                           'GPG Remote')
-            elif isinstance(exc, (BrokenPipeError, TransmissionError,
-                                  ConnectionResetError)):
-                error_exit('Server has abruptly terminated connection '
-                           'while receiving response')
-            elif isinstance(exc, FileSystemError):
-                error_exit("Unable to write file '{}'".format(exc.args[1]))
+                ConnectionResetError, FileSystemError,
+                PyassuanImportError) as exc:
+            error_handler(exc)
 
     except ConnectionRefusedError:
         error_exit('Connection to GPG Remote Server refused. '

@@ -50,6 +50,15 @@ requires gpgremote_client.py script to be moved to or symlinked from
 /usr/bin/gpg path. If both components are running on the same system,
 ensure only the server user has read-write access to GnuPG keyring files.
 
+In order to enable passphrase input over a network connection, follow these
+steps:
+
+1. Make sure standard gpg pinentry application is installed on the client.
+2. Install pyassuan[1] library on both client and server systems.
+3. Ensure gpg-agent is properly configured and running on the server, and
+   path to bundled GPG Remote pinentry.py is passed to gpg-agent using
+   --pinentry-program option (see man gpg-agent for details).
+
 
 Configuration
 -------------
@@ -88,6 +97,10 @@ security (see the next section for details).
 
 Security considerations
 -----------------------
+
+Communication channel authentication/encryption is out of the scope of this
+application. The user may employ SSH or VPN tunnelling to create a trusted
+channel for client-server communication.
 
 The threat model and main attack scenario is a client-side remote attacker
 (e.g. compromised network application) exfiltrating gpg private keys. The
@@ -150,9 +163,11 @@ processing. If the value is higher than threads count then the remaining
 requests will wait until active ones are finished. Awaiting requests does
 not take up additional resources except for a socket connection.
 
-Communication channel authentication/encryption is out of the scope of this
-application. The user may employ SSH or VPN tunnelling to create a trusted
-channel for client-server communication.
+When remote passphrase input is used, an entered passphrase never touches
+long-lived server process memory. However it gets stored in the client
+memory for the duration of gpg execution, and during that period it's
+subject to a risk of memory swapping. Make sure client swapping device is
+encrypted, disabled, or other protective measures are employed.
 
 
 Technical details
@@ -169,7 +184,27 @@ format for both directions is as follows:
   * type (str): Package identifier.
   * fields (list): Arbitrary data fields.
   * files_meta (dict): File_pathname->file_len mapping.
-  * binary (bytes): Concatenated files data.
+  * binary (bytes): Concatenated files data if any.
+
+Remote passphrase input is implemented using custom pinentry shim
+application. It employs the following communication steps (pinentry actor
+below is the custom pinentry shim application):
+
+1. server>gpg-agent: uses PINENTRY_USER_DATA environment variable (which is
+   passed over gpg > gpg-agent > pinentry execution stack) to provide
+   pinentry with IPC communication details.
+2. gpg-agent>pinentry: calls pinentry with PINENTRY_USER_DATA env var.
+3. server>pinentry: sends opened client network socket directly to the
+   custom pinentry over IPC channel (UNIX socket).
+4. pinentry>client: uses the provided network connection to send the client
+   all the required pinentry data (text strings and startup parameters).
+5. client: runs standard pinentry to aquire user response data (in the form
+   of Assuan protocol response).
+6. client>pinentry: sends user response data.
+7. pinentry>gpg-agent: replays user response in Assuan protocol exchange.
+
+If wrong passphrase is entered, steps 2-7 are performed again up to the
+number of retries required by gpg-agent.
 
 Default server listening port (29797) was produced in Python as follows:
 
@@ -179,12 +214,18 @@ Default server listening port (29797) was produced in Python as follows:
 int.from_bytes(b'gpgremote', 'big') % 2 ** 16
 ```
 
+(Although it has been noted only b'te' bytestring has any effect in such
+procedure.)
+
+
 Issues, limitations
 -------------------
 
-* Interactive passphrase input is not supported, the server can only
-  operate with unprotected private keys. An alternative is to provide
-  passphrase with --passphrase{-file} gpg option.
+* Interactive console UI operations (e.g. key generation, key edit, etc.)
+  are not supported.
+
+* Client does not support reading input from TTY, data must be piped to
+  STDIN.
 
 * Passing file descriptors and implementing other forms of advanced IPC
   interaction with gpg is not supported.
@@ -193,13 +234,13 @@ Issues, limitations
   invoked with specific environment (e.g. LANG), start GPG Remote Server
   with all the necessary variables instead.
 
-* If GnuPG 2.x or higher is used, secret key operations would spawn
-  gpg-agent dialog which will prevent gpg process from terminating. This
-  might be a feature if both GPG Remote server and client are running on
-  the same system (however make sure client's conn_timeout and server's
-  gpg_timeout are high enough for the user to type passphrase in time),
+* If GnuPG 2.x or higher is used without custom Pinentry, secret key
+  operations would spawn standard Pinentry dialog on the server side which
+  will prevent gpg process from terminating. This might be a feature if
+  both GPG Remote server and client are running on the same system,
   otherwise it's up to the server administrator to disable gpg-agent
-  server-side.
+  server-side (for example, by downgrading to GnuPG 1.4.x or starting
+  gpg-agent with --batch option).
 
 
 ToDo
@@ -207,17 +248,18 @@ ToDo
 
 * Minimize memory footprint.
 
-* gpg-agent interaction for passphrase input.
-
 * Idea: "Panic" passphrase to stop server / wipe private keys.
 
 
 Version history
 ---------------
 
-* 2015-XX-XX - v1.0b1
+* 2015-02-05 - v1.0b1
 
   - Graceful server shutdown on SIGTERM.
+  - Custom Pinentry to support passphrase input over a network.
+  - Updated timeout defaults to make them compatible with passphrase input.
+  - Code cleanup.
 
 
 * 2015-01-27 - v0.9b2
