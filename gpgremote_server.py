@@ -43,7 +43,7 @@ from subprocess import Popen, PIPE, DEVNULL, check_output, \
                         TimeoutExpired, CalledProcessError
 
 
-__version__ = '1.0b1'
+__version__ = '1.1b1'
 MIN_PYTHON = (3, 2)
 CONFIG = {
     'host': 'localhost',
@@ -65,8 +65,10 @@ CONFIG = {
     'verbosity': 'error',
     'debug': False}
 TEMP_PREFIX = 'gpgremote_'
+PANIC_PREFIX = 'panic_'
 IPC_SOCKET = 'pinentry.socket'
 IPC_POLL = 0.2
+PBKDF_ITER = 1000
 PACKAGE_ERROR = 'error'
 PACKAGE_GPG = 'gpg'
 OUTPUT_OPTS = ['-o', '--output']
@@ -380,6 +382,7 @@ Command line options:
         --unsafe        Skip safety checks on server startup
         --reuse-addr    Reuse already binded listening address:port
         --logfile       Path to log file (log to STDOUT if omitted)
+        --gen-token     Prompt for user passphrase and output "panic" token
     -v, --verbosity     Verbosity level: debug, info, error, critical
     -h, --help          Show this help screen
 """.format(ver=__version__,
@@ -405,7 +408,7 @@ def process_options():
         longopts = ['listen=', 'threads=', 'queue=', 'size-limit=', 'gpg=',
                     'whitelist=', 'config=', 'logfile=', 'verbosity=',
                     'temp=', 'conn-timeout=', 'gpg-timeout=',
-                    'reuse-addr', 'strict', 'unsafe', 'help']
+                    'reuse-addr', 'strict', 'unsafe', 'gen-token', 'help']
         opts, args = getopt.getopt(sys.argv[1:], shortopts, longopts)
     except getopt.GetoptError as exc:
         print(exc)
@@ -414,6 +417,8 @@ def process_options():
     for opt, param in opts:
         if opt in ('-h', '--help'):
             show_help()
+        elif opt == '--gen-token':
+            gen_token()
         elif opt in ('-l', '--listen'):
             host, port = param.split(':')
             CONFIG['host'] = host
@@ -450,6 +455,55 @@ def process_options():
             except ValueError:
                 error_exit('Unable to read or parse configuration '
                            'file "{}"'.format(param))
+
+
+def gen_token():
+    """Prompt user for a passphrase and [optional] iterations count,
+    generate and print PBKDF2 crypt(3)-compatible token."""
+    import termios
+    try:
+        import pbkdf2
+    except ImportError:
+        error_exit('Python pbkdf2 module not found')
+
+    # Prompting for passphrase with disabled character echo.
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    new = termios.tcgetattr(fd)
+    new[3] = new[3] & ~termios.ECHO
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
+        passwd = input('Passphrase: ')
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        print()
+
+    iter = input('Iterations ({}): '.format(PBKDF_ITER)) or PBKDF_ITER
+
+    start_time = time.time()
+    token = pbkdf2.crypt(passwd, iterations=int(iter))
+    gen_time = time.time() - start_time
+
+    print()
+    print('Hashing took {} sec'.format(round(gen_time, 2)))
+    print('Token:')
+    print(token)
+    print()
+    sys.exit(0)
+
+
+def get_panic_cmds(config):
+    """ Return "panic" commands.
+
+        Args:
+            config (dict): Configuration storage.
+
+        Returns:
+            (dict) Dict of {rule_name: (security_token, command)} format.
+    """
+    return {name[len(PANIC_PREFIX):]: opt.partition(' ')[::2]
+            for name, opt in config.items()
+            if name.startswith(PANIC_PREFIX)}
 
 
 def parse_whitelist(lines):
@@ -904,10 +958,12 @@ class Handler(BaseRequestHandler):
     """ Requests handler.
 
         Attributes:
+            pid (int): Server PID.
             cwd (tempfile.TemporaryDirectory): Temporary working for
                 gpg execution.
             gpg_argv (list): Pathname of GPG executable along with default
                 command line arguments if necessary.
+            panic_rules (dict): "Panic" rules provided to pinentry.
             whitelist (list): Parsed GPG command line options whitelist.
             tempdirs (dict): Input filenames mapping to their temporary
                 directories storage.
@@ -917,8 +973,10 @@ class Handler(BaseRequestHandler):
                 may be returned if it's True.
     """
 
+    pid = None
     cwd = None
     gpg_argv = None
+    panic_rules = {}
     whitelist = None
     tempdirs = None
     files_received = None
@@ -1191,19 +1249,21 @@ class Handler(BaseRequestHandler):
                     logging.debug)
 
                 # Update environment with pinentry IPC data consisting of
-                # 5 colon-separated elements: application version, path to
-                # IPC socket, GPG timeout value, path to gpg-remote server
-                # directory and gpg-remote server module name. The two last
-                # elements will be used to import data transmission
-                # functions from the current module.
+                # JSON-encoded list of the following elements: application
+                # version, GPG timeout value, panic options, environment
+                # variables for panic commands, path to IPC socket, path to
+                # gpg-remote server directory and gpg-remote server module
+                # name. The two last elements will be used to import data
+                # transmission functions from the current module.
                 module_path = os.path.split(os.path.abspath(__file__))
                 module_dir = module_path[0]
                 module_name = os.path.splitext(module_path[1])[0]
+                panic_env = {'GPG_REMOTE_PID': str(self.pid)}
+                ipc_data = [__version__, CONFIG['gpg_timeout'],
+                            self.panic_rules, panic_env,
+                            socket_file, module_dir, module_name]
                 env = os.environ.copy()
-                env['PINENTRY_USER_DATA'] = ':'.join([
-                                                __version__, socket_file,
-                                                str(CONFIG['gpg_timeout']),
-                                                module_dir, module_name])
+                env['PINENTRY_USER_DATA'] = json.dumps(ipc_data)
 
                 # Call gpg.
                 with Popen(gpg_argv, stdin=PIPE, stdout=PIPE, stderr=PIPE,
@@ -1419,6 +1479,14 @@ if __name__ == '__main__':
         error_exit('Queue size value cannot be less the number '
                    'of threads', log_level=logging.critical)
 
+    Handler.panic_rules = get_panic_cmds(CONFIG)
+    if Handler.panic_rules:
+        log('"Panic" rules enabled:\n{}'.
+            format('\n'.join(['   {}: {}'.format(name, item[1])
+                              for name, item
+                              in Handler.panic_rules.items()])),
+            logging.info)
+
     log('Strict mode {}'.format('enabled' if CONFIG['strict']
                                 else 'disabled'), logging.info)
     log('Connection timeout (sec): {}'.format(CONFIG['conn_timeout']),
@@ -1444,8 +1512,9 @@ if __name__ == '__main__':
         error_exit('Listening address:port already in use',
                    log_level=logging.critical)
 
+    Handler.pid = os.getpid()
     log('Server started as PID {}. Listening on {}:{}'.
-        format(os.getpid(), CONFIG['host'], CONFIG['port']), logging.info)
+        format(Handler.pid, CONFIG['host'], CONFIG['port']), logging.info)
 
     try:
         def sigterm_handler(signum, frame):

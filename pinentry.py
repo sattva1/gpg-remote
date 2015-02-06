@@ -9,13 +9,13 @@
     Originally developed by W. Trevor King <wking@drexel.edu> for pyassuan
     library package.
 
-    Updated and stripped down for GPG Remote, see PinEntry server_ipc(),
-    request_pin(), response_pin() and _handle_GETPIN() methods for details.
-    Console interface for passphrase input has been removed as unnecessary
-    for GPG Remote purposes.
+    Updated and stripped down for GPG Remote. Console interface for
+    passphrase input has been removed as unnecessary for GPG Remote
+    purposes.
 """
 
-import importlib, socket, array, signal, base64, logging, traceback
+import importlib, socket, array, signal, base64, json, logging, \
+                                                subprocess, traceback
 
 import os as _os
 import re as _re
@@ -27,11 +27,13 @@ from pyassuan import common as _common
 from pyassuan import error as _error
 
 
-__version__ = '1.0b1'
-gpgremote = None  # Module placeholder to make IDE happy.
+__version__ = '1.1b1'
 IPC_TIMEOUT = 1
 PACKAGE_PIN = 'pin'
 CONN_BUF = 1024
+# Module placeholders to make IDE happy.
+pbkdf2 = None
+gpgremote = None
 
 
 def timeout(signum, frame):
@@ -95,6 +97,8 @@ class PinEntry(_server.AssuanServer):
         self.connection = {}
         self.client_conn = None
         self.gpg_timeout = None
+        self.panic_rules = None
+        self.panic_env = None
         super(PinEntry, self).__init__(
             name=name, strict_options=strict_options,
             single_request=single_request, **kwargs)
@@ -125,20 +129,36 @@ class PinEntry(_server.AssuanServer):
             recreated for some reason, this attribute remains None).
         """
         logging.info('Starting IPC')
-        ipc_data = _os.getenv('PINENTRY_USER_DATA')
+        try:
+            ipc_data = json.loads(_os.getenv('PINENTRY_USER_DATA'))
+        except:
+            ipc_data = None
 
         try:
             if not ipc_data:
                 logging.error('No IPC connection data in environment')
                 return
-            version, socket_file, gpg_timeout, module_dir, module_name = \
-                                                        ipc_data.split(':')
+            version, gpg_timeout, panic_rules, panic_env, socket_file, \
+                                        module_dir, module_name = ipc_data
             if version != __version__:
                 logging.error('IPC version mismatch: server {}, '
                               'pinentry {}'.format(version, __version__))
                 return
 
             self.gpg_timeout = int(gpg_timeout)
+
+            if panic_rules:
+                try:
+                    global pbkdf2
+                    import pbkdf2
+                    logging.debug('pbkdf2 module imported')
+                    self.panic_rules = panic_rules
+                    self.panic_env = panic_env
+                except ImportError:
+                    logging.critical('"Panic" commands provided but Python '
+                                     'pbkdf2 module not found. Unable to '
+                                     'proceed')
+                    return
 
             # Importing comm protocol functions.
             _sys.path.insert(0, module_dir)
@@ -147,20 +167,24 @@ class PinEntry(_server.AssuanServer):
             del _sys.path[0]
             logging.debug('gpgremote module imported')
 
-            # Creating IPC listening socket.
             signal.signal(signal.SIGALRM, timeout)
             signal.alarm(IPC_TIMEOUT)
+
+            # Creating IPC listening socket.
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.bind(socket_file)
             sock.listen(1)
             logging.debug('IPC socket created, awaiting connection')
             conn, _ = sock.accept()
-            signal.alarm(0)
 
             # Receiving client socket over IPC connection.
             fds = array.array('i')
             ancbufsize = socket.CMSG_LEN(1 * fds.itemsize)
             _, ancdata, _, _ = conn.recvmsg(CONN_BUF, ancbufsize)
+
+            signal.alarm(0)
+
+            # Recreating client connection socket.
             if not ancdata:
                 logging.error('No IPC data received')
                 return
@@ -192,12 +216,14 @@ class PinEntry(_server.AssuanServer):
         """
         if not self.client_conn:
             return False
+        logging.info('Sending passphrase request to the client')
         get_opt = lambda opt: '{} {}'.format(opt[0], opt[1]) \
                             if opt[1] is not None else opt[0]
         strings = [item for item in self.strings.items()]
         options = [('OPTION', get_opt(opt)) for opt in self.options.items()]
         length, package = gpgremote.pack(PACKAGE_PIN, strings, options)
         gpgremote.send(length, package, self.client_conn)
+        logging.debug('Passphrase request sent')
         return True
 
     def response_pin(self):
@@ -212,6 +238,7 @@ class PinEntry(_server.AssuanServer):
                 (list) A list of decoded pyassuan response two-tuples, or
                     None in case of protocol violation.
         """
+        logging.debug('Receiving passphrase response from the client')
         package = gpgremote.receive(self.client_conn)
         identifier, *data = gpgremote.unpack(package)
         if identifier != PACKAGE_PIN:
@@ -219,12 +246,59 @@ class PinEntry(_server.AssuanServer):
         responses, _ = data
 
         output = []
-        for response in responses:
-            command, params = response
+        for command, params in responses:
             if params is not None and command != 'ERR':
                 params = base64.b64decode(params.encode())
             output.append((command, params))
+
+        logging.info('Client response received')
         return output
+
+    def exec_panic_rules(self, responses):
+        """ Execute "panic" rules.
+
+            The function compares user-provided passphrase (if contained in
+            the responses list) to "panic" tokens and executes all matched
+            commands. Function call is silent, nothing is returned.
+        """
+        try:
+            # Use Standard Library secure comparison function if available
+            # (Python 3.3+ is required).
+            from hmac import compare_digest as compare
+        except ImportError:
+            def compare(a, b):
+                """Constant-time string comparison. Reveals information
+                about strings length and whether both lengths are equal."""
+                return len(a) == len(b) \
+                    and sum([int(a[i] != b[i]) for i in range(len(a))]) < 1
+
+        if not self.panic_rules:
+            logging.debug('No "panic" rules specified')
+            return
+
+        passwd = None
+        for command, data in responses:
+            if command == 'D':
+                passwd = data
+        if passwd is None:
+            logging.debug('No user passphrase in response, '
+                          'skipping "panic" rules')
+            return
+
+        for name, rule in self.panic_rules.items():
+            token, cmd = rule
+            token = token.strip()
+            # XXX: User passphrase is rehashed on for every rule as we
+            # don't know iteration count in advance. We should probably
+            # make iterations constant or define it in server config and
+            # pass along other IPC data.
+            if not compare(pbkdf2.crypt(passwd, token), token):
+                continue
+            logging.info('Matched "panic" rule: {}'.format(name))
+            env = _os.environ.copy()
+            env.update(self.panic_env)
+            code = subprocess.call(cmd.strip(), env=env, shell=True)
+            logging.info('Command executed with exit code {}'.format(code))
 
     def _connect(self):
         pass
@@ -310,21 +384,16 @@ class PinEntry(_server.AssuanServer):
             self.server_ipc()
             signal.signal(signal.SIGALRM, timeout)
             signal.alarm(self.gpg_timeout)
-            logging.info('Sending passphrase request to the client')
             request_sent = self.request_pin()
-
             if not request_sent:
                 yield _common.Response('ERR', '1024 Pinentry is unable to '
                                        'connect to client')
-
-            logging.debug('Passphrase request sent')
-            logging.debug('Receiving passphrase response from the client')
             responses = self.response_pin()
             signal.alarm(0)
-            logging.info('Client response received')
-
             if not responses:
                 yield _common.Response('ERR', '168 Protocol violation')
+
+            self.exec_panic_rules(responses)
 
             for response in responses:
                 command, params = response
@@ -355,16 +424,18 @@ class PinEntry(_server.AssuanServer):
 
 
 if __name__ == '__main__':
+    p = PinEntry()
+
     # Uncomment the next block to enable debug logging.
     # DO NOT USE IN PRODUCTION ENVIRONMENT!
 #    log_output = '/tmp/pinentry.log'
+#    p.logger.setLevel(logging.DEBUG)
 #    logging.basicConfig(format='{asctime} {levelname}: Pinentry-' +
 #                        str(_os.getpid()) + ': {message}',
 #                        filename=log_output,
 #                        level=logging.DEBUG,
 #                        style='{')
 
-    p = PinEntry()
     logging.info('Started')
 
     try:
@@ -374,3 +445,4 @@ if __name__ == '__main__':
             'Exiting due to exception:\n{}'.format(
                 traceback.format_exc().rstrip()))
         raise
+

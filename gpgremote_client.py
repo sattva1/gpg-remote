@@ -25,7 +25,7 @@
 import sys, os, json, io, socket, signal
 
 
-__version__ = '1.0b1'
+__version__ = '1.1b1'
 MIN_PYTHON = (3, 2)
 CONFIG = {
     'host': 'localhost',
@@ -639,9 +639,10 @@ class PackageHandler(object):
                               'GPG Remote Server:\n' + element[1])
         # Update ttyname option.
         for i, element in enumerate(options):
-            if element[1] is not None and element[1].startswith('ttyname='):
+            if element[1] is not None \
+                            and element[1].split(' ')[0] == 'ttyname':
                 ttyname = os.ttyname(sys.stdin.fileno())
-                options[i] = (element[0], 'ttyname=' + ttyname)
+                options[i] = (element[0], ' '.join(['ttyname', ttyname]))
 
         response = self._get_pin(options, strings)
         self.send_package_pin(response)
@@ -671,7 +672,11 @@ class PackageHandler(object):
                                             close_on_disconnect=True)
 
         try:
-            with Popen(['pinentry'], stdin=PIPE, stdout=PIPE) as pinentry:
+            use_curses = os.getenv('PINENTRY_USER_DATA', '').\
+                                            startswith('USE_CURSES=')
+            executable = 'pinentry' if not use_curses else 'pinentry-curses'
+
+            with Popen([executable], stdin=PIPE, stdout=PIPE) as pinentry:
                 client.input = pinentry.stdout
                 client.output = pinentry.stdin
                 client.connect()
@@ -694,7 +699,8 @@ class PackageHandler(object):
                     client.disconnect()
 
         except FileNotFoundError:
-            error_exit('Pinentry program not found')
+            error_exit("Pinentry executable '{}' not found".
+                       format(executable))
 
     def handle_package_error(self, *data):
         """ Process 'error' type response package.

@@ -61,6 +61,10 @@ steps:
    and path to bundled GPG Remote ``pinentry.py`` is passed to ``gpg-agent``
    using ``--pinentry-program`` option (see ``man gpg-agent`` for details).
 
+If "panic" rules support is required (see the corresponsing section below),
+install [``pbkdf2``](https://pypi.python.org/pypi/pbkdf2) Python module on
+the server system.
+
 
 Configuration
 -------------
@@ -75,6 +79,10 @@ environment variable). However, specific path can be provided with
 ``-c``/``--config`` option to server invocation (``-h``/``--help`` will
 print all available options). Most server parameters can be reconfigured
 from the command line as well.
+
+
+Whitelist
+---------
 
 The second part of server configuration is ``gpg`` options whitelist
 defined in ``whitelist.conf`` in the same directory as server config file.
@@ -96,6 +104,43 @@ to server security (see the next section for details).
     * If a word is bracketed ``#NO_FILES``, it means no files should be
       expected in arguments list for this options set (see the next
       section).
+
+
+"Panic" rules
+-------------
+
+It is possible to configure an arbitrary amount of so called "panic" rules.
+These rules can be used to execute specific shell commands on the server in
+the event a predefined passphrase is entered in ``pinentry`` dialog.
+(Please note: bundled GPG Remote ``pinentry.py`` must be used, see
+Installation section above for detailed requirements.)
+
+Each rule is specified as an entry in the server configuration file. Entry
+name must begin with ``panic_`` prefix followed by a unique name. Entry
+value consits of a space-sperated security token and shell command(s) in
+regular notation (i.e. no quoting or escaping is necessary). Security token
+is a PBKDF2 ``crypt(3)``-compatible hash string generated from a passphrase
+that should trigger a specific rule. Running server with ``--gen-token``
+option will help to generate a token for a particular passphrase.
+
+A single passphrase can trigger any amount of rules if all of them use the
+same passphrase protection (but not necesserily the same token literatim).
+A triggered command is silently executed by the server-side ``pinentry``
+process with access permissions of ``gpg-agent`` parent user prior to
+resending the entered passphrase to ``gpg-agent``. Matched rules are
+executed in arbitrary order, you should not rely on their particular
+sorting in the configuration file.
+
+Note that triggered rule does not stops any of GPG Remote components, and
+if the rule passphrase matches passphrase of private key used for a given
+operation, an operation will proceed as usual despite the executed "panic"
+command. Moreover, take into account that ``gpg-agent`` reads the private
+key in memory _before_ spawning ``pinentry``, and simply running
+``rm``/``wipe`` to delete private keyring files will not destroy the key
+immediately - it is also necessary to send SIGKILL to the running GPG
+Remote server process to prevent it sending ``gpg`` operation results back
+to client. You may use ``GPG_REMOTE_PID`` environment variable in the rule
+definition as it will be set to server process ID.
 
 
 Security considerations
@@ -171,8 +216,8 @@ finished. Awaiting requests does not take up additional resources except
 for a socket connection.
 
 When remote passphrase input is used, an entered passphrase never touches
-long-lived server process memory. However it gets stored in the client
-memory for the duration of ``gpg`` execution, and during that period it's
+long-lived server process memory. However it remains in the client memory
+for the whole duration of ``gpg`` execution, and during that period it's
 subject to a risk of memory swapping. Make sure client swapping device is
 encrypted, disabled, or other protective measures are employed.
 
@@ -203,20 +248,24 @@ stated):
    (which is passed over ``gpg > gpg-agent > pinentry`` execution stack) to
    provide ``pinentry`` with IPC communication details.
 2. ``gpg-agent>pinentry``: calls ``pinentry`` with ``PINENTRY_USER_DATA``
-   env var.
+   environment variable and initiates Assuan protocol.
 3. ``server>pinentry``: sends opened client network socket directly to the
    custom ``pinentry`` over IPC channel (UNIX socket).
 4. ``pinentry>client``: uses the provided network connection to send the
    client all the required ``pinentry`` data (text strings and startup
-   parameters).
+   parameters) got from ``gpg-agent`` at step 2.
 5. ``client``: runs standard ``pinentry`` to aquire user response data (in
    the form of Assuan protocol response).
 6. ``client>pinentry``: sends user response data.
-7. ``pinentry>gpg-agent``: replays user response in Assuan protocol
+7. ``pinentry``: executes "panic" commands if any are triggered by the
+   client passphrase.
+8. ``pinentry>gpg-agent``: replays user response in Assuan protocol
    exchange.
 
-If wrong passphrase is entered, steps 2-7 are performed again up to the
+If wrong passphrase is entered, steps 2-8 are performed again up to the
 number of retries required by ``gpg-agent``.
+
+"Panic" rules security token effective entropy is limited to 192 bits.
 
 Default server listening port (29797) was produced in Python as follows:
 
@@ -260,16 +309,20 @@ ToDo
 
 * Minimize memory footprint.
 
-* Idea: "Panic" passphrase to stop server / wipe private keys.
-
 
 Version history
 ---------------
 
+* 2015-02-06 - ``v1.1b1``
+    - Fixed 'ttyname' Assuan option update on the client side.
+    - Honour PINENTRY_USER_DATA="USE_CURSES=1" environment variable.
+    - Support for "panic" commands.
+
 * 2015-02-05 - ``v1.0b1``
     - Graceful server shutdown on SIGTERM.
     - Custom Pinentry to support passphrase input over a network.
-    - Updated timeout defaults to make them compatible with passphrase input.
+    - Updated timeout defaults to make them compatible with passphrase
+      input.
     - Code cleanup.
 
 * 2015-01-27 - ``v0.9b2``
