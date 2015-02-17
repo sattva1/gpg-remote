@@ -41,7 +41,7 @@ as newly generates files) is sent back to client.
 Installation
 ------------
 
-Make sure you have Python 3.2.x or later installed on all systems you plan
+Make sure you have Python 3.3.x or later installed on all systems you plan
 to use for client and server operation. Both client and server modules are
 self-contained, and can be placed anywhere on the system.
 
@@ -76,9 +76,9 @@ directory unless path is overridden with ``GNUPGHOME`` environment variable.
 By default server reads its configuration from ``gpgremote_server.conf``
 file located in ``~/.gnupg`` (the path can be overridden with ``GNUPGHOME``
 environment variable). However, specific path can be provided with
-``-c``/``--config`` option to server invocation (``-h``/``--help`` will
-print all available options). Most server parameters can be reconfigured
-from the command line as well.
+``-c``/``--config`` option to server invocation. Most server parameters
+can be reconfigured from the command line as well (``-h``/``--help`` will
+print all available options).
 
 
 Whitelist
@@ -87,7 +87,7 @@ Whitelist
 The second part of server configuration is ``gpg`` options whitelist
 defined in ``whitelist.conf`` in the same directory as server config file.
 The syntax is simple, yet configuring the whitelist correctly is critical
-to server security (see the next section for details).
+to server security (see _Security considerations_ section for details).
 
 1. Lines not starting with a dash sign are ignored.
 2. A single set of options per line.
@@ -102,8 +102,8 @@ to server security (see the next section for details).
       whitelisted values must be provided on the same line (quoting /
       space-escaping is supported).
     * If a word is bracketed ``#NO_FILES``, it means no files should be
-      expected in arguments list for this options set (see the next
-      section).
+      expected in arguments list for this options set (see _Security
+      considerations_ section below).
 
 
 "Panic" rules
@@ -113,34 +113,47 @@ It is possible to configure an arbitrary amount of so called "panic" rules.
 These rules can be used to execute specific shell commands on the server in
 the event a predefined passphrase is entered in ``pinentry`` dialog.
 (Please note: bundled GPG Remote ``pinentry.py`` must be used, see
-Installation section above for detailed requirements.)
+_Installation_ section above for detailed requirements.)
 
 Each rule is specified as an entry in the server configuration file. Entry
 name must begin with ``panic_`` prefix followed by a unique name. Entry
 value consits of a space-sperated security token and shell command(s) in
-regular notation (i.e. no quoting or escaping is necessary). Security token
-is a PBKDF2 ``crypt(3)``-compatible hash string generated from a passphrase
-that should trigger a specific rule. Running server with ``--gen-token``
-option will help to generate a token for a particular passphrase.
+regular notation (i.e. no quoting or escaping is necessary), or a special
+command (see below). Security token is a PBKDF2 hash string generated from
+a passphrase that should trigger a specific rule. Running server with
+``--gen-token`` option will help to generate a token for a particular
+passphrase.
 
 A single passphrase can trigger any amount of rules if all of them use the
 same passphrase protection (but not necesserily the same token literatim).
 A triggered command is silently executed by the server-side ``pinentry``
 process with access permissions of ``gpg-agent`` parent user prior to
 resending the entered passphrase to ``gpg-agent``. Matched rules are
-executed in arbitrary order, you should not rely on their particular
-sorting in the configuration file.
+executed in the order they are defined in the configuration file.
 
-Note that triggered rule does not stops any of GPG Remote components, and
-if the rule passphrase matches passphrase of private key used for a given
-operation, an operation will proceed as usual despite the executed "panic"
-command. Moreover, take into account that ``gpg-agent`` reads the private
-key in memory _before_ spawning ``pinentry``, and simply running
-``rm``/``wipe`` to delete private keyring files will not destroy the key
-immediately - it is also necessary to send SIGKILL to the running GPG
-Remote server process to prevent it sending ``gpg`` operation results back
-to client. You may use ``GPG_REMOTE_PID`` environment variable in the rule
-definition as it will be set to server process ID.
+The following environment variables are passed to "panic" shell commands:
+
+* ``GPG_REMOTE_PID``: PID of the GPG Remote server process.
+* ``GPG_REMOTE_KEYRINGS``: Space-separated list of paths to non-empty
+  ``gpg`` keyring files.
+
+The following special commands may be used instead of shell commands in
+"panic" rule definitions. Please note that a single special command only
+can be specified for any rule:
+
+* ``STOP``: Stop GPG Remote server gracefully. Server will send the client
+  a general error message, finish processing of any concurrent requests,
+  clean up all the data received from the client, and exit.
+* ``KILL``: Terminate GPG Remote server immediately. Server will send
+  ``SIGKILL`` signal to itself without performing any cleanup procedures.
+
+Please take into account that ``gpg-agent`` reads the private key in memory
+_before_ spawning ``pinentry``, and simply running ``rm``/``wipe`` to
+delete private keyring files will not destroy the key immediately - it is
+necessary to terminate the running GPG Remote server process (using ``STOP``
+or ``KILL`` special commands) to prevent sending ``gpg`` operation results
+back to the client. Use rules chaining (by assigning the same security
+token / passphrase to multiple rules) to run multiple commands when needed.
 
 
 Security considerations
@@ -161,8 +174,8 @@ keys to the keyring by simply sending them to STDIN (``gpg`` processes it
 contextually). If this should be avoided, it's up to the server
 administrator to run the server as a user without write access to ``gpg``
 keyring files. Remember that default ``gpg`` keyrings can be overridden
-with ``--no-default-keyring``, ``--secret-keyring`` and
-``--keyring options``.
+with ``--no-default-keyring``, ``--secret-keyring`` and ``--keyring``
+options.
 
 Another potential risk to the server is its local files exfiltration. In
 the naive case the user could ask the server to run ``gpg -o - --enarmor
@@ -190,7 +203,7 @@ system-wide temp directory (commonly, ``/tmp``), but in case this directory
 is unsafe, it can be overridden using ``TEMP`` environment variable, or
 ``--temp`` command line option for server invocation. (Note that files
 aren't written directly to tempdir, but to temporary subdirectories with
-0700 access mode).
+0700 access mode, i.e. accessable only by GPG Remote server user).
 
 As neither client nor server employ any semantic analysis of command line
 arguments (i.e. does not understand the meaning of options and commands),
@@ -221,6 +234,12 @@ for the whole duration of ``gpg`` execution, and during that period it's
 subject to a risk of memory swapping. Make sure client swapping device is
 encrypted, disabled, or other protective measures are employed.
 
+If "panic" rules are configured on the server with high hashing iterations
+count, an adversary can potentially deduce this fact from a delay of ``gpg``
+output as user passphrase must be matched to each unique security token.
+It is also possible to detect "panic" rules execution if the executed
+command takes a long time to complete.
+
 
 Technical details
 -----------------
@@ -228,16 +247,23 @@ Technical details
 Communication protocol is a simple two-step request-response. Package
 format for both directions is as follows:
 
-  ``[len_p] | [len_j] | JSON([ver], [type], [fields], [files_meta]) |
-  [binary]``
+``<len_p> | <len_j> | JSON(<header>, <type>, <fields>, <files_meta>) |
+[binary]``
 
-  * ``len_p`` (8 bytes): Overall package length.
-  * ``len_i`` (8 bytes): JSON packet length.
-  * ``ver`` (str): Application version.
-  * ``type`` (str): Package identifier.
-  * ``fields`` (list): Arbitrary data fields.
-  * ``files_meta`` (dict): ``File_pathname->file_len`` mapping.
-  * ``binary`` (bytes): Concatenated files data if any.
+* ``len_p`` (8 bytes): Overall package length.
+* ``len_j`` (8 bytes): JSON packet length.
+* ``header`` (list): ``auth`` token (optional) and application ``version``.
+* ``type`` (str): Package identifier.
+* ``fields`` (list): Arbitrary data fields.
+* ``files_meta`` (dict): ``File_pathname->file_len`` mapping.
+* ``binary`` (bytes): Concatenated files data (optional).
+
+If authentication token is provided, it is expected to be a HMAC-SHA256 hex
+digest of all JSON-packed metadata, and is calculated as follows: the
+metadata elements (except for ``auth``) are packed as a flat list in the
+above mentioned order into a JSON-encoded string, which is passed to HMAC
+context. Authentication is currently used for server<>``pinentry`` IPC
+only. As such, binary data is not authenticated.
 
 Remote passphrase input is implemented using custom ``pinentry`` shim
 application. It employs the following communication steps (``pinentry``
@@ -246,7 +272,8 @@ stated):
 
 1. ``server>gpg-agent``: uses ``PINENTRY_USER_DATA`` environment variable
    (which is passed over ``gpg > gpg-agent > pinentry`` execution stack) to
-   provide ``pinentry`` with IPC communication details.
+   provide ``pinentry`` with IPC communication details including IPC socket
+   and session authentication key.
 2. ``gpg-agent>pinentry``: calls ``pinentry`` with ``PINENTRY_USER_DATA``
    environment variable and initiates Assuan protocol.
 3. ``server>pinentry``: sends opened client network socket directly to the
@@ -265,7 +292,14 @@ stated):
 If wrong passphrase is entered, steps 2-8 are performed again up to the
 number of retries required by ``gpg-agent``.
 
-"Panic" rules security token effective entropy is limited to 192 bits.
+It should be noted that although IPC UNIX socket (used for
+server<>``pinentry`` communication) access is not resticted (in order to
+allow running server and ``gpg-agent`` under different users), server
+verifies authenticity of packages received using the session auth key it
+provides ``pinentry`` process with.
+
+"Panic" rules security token is a PBKDF2[SHA-1, HMAC] output with effective
+entropy limit of 256 bits. 64-bit salt value is used.
 
 Default server listening port (29797) was produced in Python as follows:
 
@@ -313,6 +347,23 @@ ToDo
 Version history
 ---------------
 
+* 2015-02-17 - ``v1.2b``
+    - Updated minimum Python version requirement to 3.3 (it was mistakenly
+      lower).
+    - Raised default logging verbosity to info level.
+    - Matched "panic" rules are executed in the defined order.
+    - New "panic" rules security token format replacing ``crypt(3)`` one.
+      Output length limit is 256 bits now instead of 192 bits.
+    - Optimized security token matching scheme (speed-wise) if the same
+      token is used for multiple rules.
+    - Changed Server<>Pinentry IPC interface and protocol.
+    - Set IPC message size limit to 64 KB (was a possible DoS scenario).
+    - Special "panic" commands to properly terminate server.
+    - Fixed IPC socket permissions which prevented running server and
+      ``gpg-agent`` under different users.
+    - Fixed error handling if ``gpg`` executable cannot be found.
+    - Code cleanup and reorganization.
+
 * 2015-02-06 - ``v1.1b1``
     - Fixed 'ttyname' Assuan option update on the client side.
     - Honour PINENTRY_USER_DATA="USE_CURSES=1" environment variable.
@@ -351,5 +402,5 @@ sattva@vladmiller.info
 
 http://vladmiller.info
 
-0x8443620A
+``0x8443620A``
 

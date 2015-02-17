@@ -27,25 +27,22 @@
     Client connections are not authenticated, and all requests are
     considered untrusted.
 
-    Issues:
-
-    * Excessive memory consumption (twice as high as request package size).
-      Can be optimized with generators.
-
     See README for additional details.
 """
 
 import sys, os, getopt, io, json, shlex, logging, tempfile, \
-    threading, signal, time, socket, array
-from socketserver import TCPServer, ThreadingMixIn, BaseRequestHandler
+        threading, signal, time, socket, array, math, weakref
+from collections import OrderedDict
+from socketserver import TCPServer, UnixStreamServer, \
+                        ThreadingMixIn, BaseRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 from subprocess import Popen, PIPE, DEVNULL, check_output, \
                         TimeoutExpired, CalledProcessError
 
 
-__version__ = '1.1b1'
-MIN_PYTHON = (3, 2)
-CONFIG = {
+__version__ = '1.2b'
+MIN_PYTHON = (3, 3)
+CONFIG = OrderedDict({
     'host': 'localhost',
     'port': 29797,
     'conn_timeout': 15,
@@ -62,15 +59,24 @@ CONFIG = {
                                 'gpgremote_server.conf'),
     'tempdir': os.getenv('TEMP', '/tmp'),
     'logfile': '',
-    'verbosity': 'error',
-    'debug': False}
+    'verbosity': 'info',
+    'debug': False})
 TEMP_PREFIX = 'gpgremote_'
 PANIC_PREFIX = 'panic_'
 IPC_SOCKET = 'pinentry.socket'
-IPC_POLL = 0.2
-PBKDF_ITER = 1000
+IPC_POLL = 0.1
+IPC_TIMEOUT = 5
+IPC_SIZE_LIMIT = 65536  # Bytes.
+IPC_KEY_LEN = 128 // 8  # Bytes.
+PBKDF2_ITER_DEFAULT = 1000
+PBKDF2_ITER_MAX = 2 ** 16
+PBKDF2_SALT = 64 // 8  # Bytes.
+PBKDF2_LEN = 256 // 8  # Bytes.
 PACKAGE_ERROR = 'error'
 PACKAGE_GPG = 'gpg'
+PACKAGE_INIT = 'init'
+PACKAGE_PANIC = 'panic'
+PACKAGE_COMMAND = 'command'
 OUTPUT_OPTS = ['-o', '--output']
 NO_FILES = '[#NO_FILES]'
 CONN_BUF = 4096
@@ -94,6 +100,10 @@ class PackageError(GPGRemoteException):
 
 
 class VersionMismatchError(GPGRemoteException):
+    pass
+
+
+class AuthenticationError(GPGRemoteException):
     pass
 
 
@@ -121,8 +131,8 @@ class DebugStub(GPGRemoteException):
     pass
 
 
-def handle_exc(*exc):
-    return tuple(exc) if not CONFIG['debug'] else DebugStub
+def handle_exc():
+    return Exception if not CONFIG['debug'] else DebugStub
 
 
 ##########################
@@ -131,6 +141,20 @@ def handle_exc(*exc):
 
 # This section is identical for both client and server but duplicated
 # in order to keep modules self-contained.
+
+try:
+    # Use Standard Library secure comparison function if available (with
+    # Python 3.3+) instead of own implementation.
+    from hmac import compare_digest
+    secure_compare = compare_digest  # Make IDE happy.
+except ImportError:
+    def secure_compare(a, b):
+        """Constant-time string/bytes comparison. Only reveals information
+        about values length, and whether values types and their lengths are
+        same/equal."""
+        return len(a) == len(b) and isinstance(a, type(b)) \
+                and sum([int(a[i] != b[i]) for i in range(len(a))]) < 1
+
 
 def update_config(path, storage, silent=True):
     """ Update application configuration from the conf file (if exists).
@@ -170,7 +194,7 @@ def update_config(path, storage, silent=True):
             raise ValueError
 
 
-def pack(identifier, *fields, files=None):
+def pack(identifier, *fields, files=None, auth_key=None):
     """ Prepare package for sending.
 
         Args:
@@ -178,6 +202,9 @@ def pack(identifier, *fields, files=None):
             *fields: Data fields to include in the package. Data types
                 must be JSON-compatible.
             files (dict): Mapping of files binary data to filenames.
+            auth_key (bytes): Package contents authentication key (not used
+                for binary data). Must be bool(auth_key) == True to enable
+                authentication.
 
         Returns:
             (tuple) Package ready for transmission: its length (int) and
@@ -195,9 +222,18 @@ def pack(identifier, *fields, files=None):
     length = 0
     output = io.BytesIO()
     files = files or {}
-
     files_meta = [(name, len(data)) for name, data in files.items()]
-    package = json.dumps([__version__, identifier, fields, files_meta],
+
+    hmac_local = ''
+    if auth_key:
+        import hashlib, hmac
+
+        contents = json.dumps([__version__, identifier, fields, files_meta])
+        hmac_local = hmac.new(auth_key, contents.encode(),
+                              hashlib.sha256).hexdigest()
+
+    header = [hmac_local, __version__]
+    package = json.dumps([header, identifier, fields, files_meta],
                          ensure_ascii=False, separators=(',', ':')).encode()
 
     # Writing header.
@@ -213,11 +249,14 @@ def pack(identifier, *fields, files=None):
     return length, output
 
 
-def unpack(package):
+def unpack(package, auth_key=None):
     """ Unpack received package.
 
         Args:
             package (io.BytesIO): Received package stream.
+            auth_key (bytes): Package contents authentication key (not used
+                for binary data). Must be bool(auth_key) == True to enable
+                authentication.
 
         Returns:
             (tuple) Package type identifier (str), packed fields (list),
@@ -228,20 +267,36 @@ def unpack(package):
             VersionMismatchError: In case the package was created with a
                 different application version. Packer version is passed as
                 exception's first argument.
+            AuthenticationError: In case of authenticated package
+                verification failure.
     """
     try:
         length = int.from_bytes(package.read(HEADER_LEN), 'big')
-        version, identifier, fields, files_meta = json.loads(
+        header, identifier, fields, files_meta = json.loads(
                                             package.read(length).decode())
-        if version == __version__:
-            files = {filename: package.read(length)
-                     for filename, length in files_meta}
-            return identifier, fields, files
-    except:
-        raise PackageError
+        hmac_received, version = header
 
-    # Can get here only in case of version mismatch.
-    raise VersionMismatchError(version)
+        if auth_key:
+            import hashlib, hmac
+
+            contents = json.dumps([version, identifier, fields, files_meta])
+            hmac_local = hmac.new(auth_key, contents.encode(),
+                                  hashlib.sha256).hexdigest()
+            if not secure_compare(hmac_local, hmac_received):
+                raise AuthenticationError
+
+        if version != __version__:
+            raise VersionMismatchError
+
+        files = {filename: package.read(length)
+                 for filename, length in files_meta}
+        return identifier, fields, files
+
+    except Exception as exc:
+        if isinstance(exc, (VersionMismatchError, AuthenticationError)):
+            raise
+        else:
+            raise PackageError
 
 
 def send(length, data, conn, _override_length=None):
@@ -456,10 +511,13 @@ def process_options():
                 error_exit('Unable to read or parse configuration '
                            'file "{}"'.format(param))
 
-
 def gen_token():
-    """Prompt user for a passphrase and [optional] iterations count,
-    generate and print PBKDF2 crypt(3)-compatible token."""
+    """ Prompt user for a passphrase and [optional] iterations count,
+    generate and print PBKDF2 token.
+
+        Token format is a string of colon-delimited encoded elements:
+        iterations count (as bytes representation), salt, hash.
+    """
     import termios
     try:
         import pbkdf2
@@ -478,11 +536,23 @@ def gen_token():
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         print()
 
-    iter = input('Iterations ({}): '.format(PBKDF_ITER)) or PBKDF_ITER
+    iter = input('Iterations ({}): '.format(PBKDF2_ITER_DEFAULT)) \
+                                                or str(PBKDF2_ITER_DEFAULT)
+    if iter and (not iter.isdecimal() or int(iter) < 1
+                 or int(iter) >= PBKDF2_ITER_MAX):
+        error_exit('Iterations count must be 0 < i < {}. '
+                   'Use none for default'.format(PBKDF2_ITER_MAX), code=2)
 
     start_time = time.time()
-    token = pbkdf2.crypt(passwd, iterations=int(iter))
+    iter = int(iter)
+    salt = os.urandom(PBKDF2_SALT)
+    hash = pbkdf2.PBKDF2(passwd, salt, iter).read(PBKDF2_LEN)
     gen_time = time.time() - start_time
+
+    encode_token = AnyBase(AnyBase.BASE62, strict_len=False).encode
+    iter = int.to_bytes(iter, int(math.log(PBKDF2_ITER_MAX, 256)), 'big')
+    token = ':'.join([encode_token(element) for element
+                      in (iter, salt, hash)])
 
     print()
     print('Hashing took {} sec'.format(round(gen_time, 2)))
@@ -499,11 +569,18 @@ def get_panic_cmds(config):
             config (dict): Configuration storage.
 
         Returns:
-            (dict) Dict of {rule_name: (security_token, command)} format.
+            (list) List of (name, [token, command]) two-tuples.
     """
-    return {name[len(PANIC_PREFIX):]: opt.partition(' ')[::2]
-            for name, opt in config.items()
-            if name.startswith(PANIC_PREFIX)}
+    commands = [(name[len(PANIC_PREFIX):], opt.partition(' ')[::2])
+                for name, opt in config.items()
+                if name.startswith(PANIC_PREFIX)]
+    # Stop with error if crypt(3) format token is found.
+    if any([val[0].find('$') >= 0 for name, val in commands]):
+        error_exit('crypt(3)-format "panic" security token detected in '
+                   'server configuration file. Please use --gen-token '
+                   'to regenerate security tokens according to the new '
+                   'format')
+    return commands
 
 
 def parse_whitelist(lines):
@@ -788,30 +865,28 @@ def flatten_args(args):
             if item is not None]
 
 
-def keyrings_writeable(gpg_argv):
-    """ Return True if any of the default server keyrings are writeable by
-    the current [server] user.
+def get_keyrings(gpg_argv):
+    """ Return a list of default server keyrings.
 
         The function relies on gpg to get all the keyring filenames by
         calling it with --list-options show-keyring --list-{secret-}keys.
         All lines starting with a slash are assumed to be keyring
         filenames.
 
-        NB: If some/all keyrings are merely empty the function may return
-        false negative.
+        NB: The function is not able to detect filenames of empty keyrings
+        as gpg does not shows them in its output.
 
         Args:
             gpg_argv (list): GPG invocation arguments (including
                 executable pathname).
 
         Returns:
-            (tuple) Keyrings writeable flag (bool), and keyrings
-                checked (list).
+            (list) Pathnames of all non-empty keyrings returned by gpg.
 
         Raises:
             FileNotFoundError: In case gpg executable does not exist.
     """
-    def get_keyrings(args, keyrings):
+    def _get_keyrings(args, keyrings):
         """Call GPG with provided additional args and collect keyring
         pathnames in the keyrings list."""
 
@@ -820,17 +895,16 @@ def keyrings_writeable(gpg_argv):
                                   universal_newlines=True)
         except CalledProcessError as exc:
             stdout = exc.output
-        keyrings += [line for line in stdout.splitlines()
-                     if line.startswith('/')]
+        keyrings.update(set([line for line in stdout.splitlines()
+                             if line.startswith('/')]))
 
-    keyrings = []
-    get_keyrings(['--list-options', 'show-keyring', '--list-keys'],
-                 keyrings)
-    get_keyrings(['--list-options', 'show-keyring', '--list-secret-keys'],
-                 keyrings)
+    keyrings = set()
+    _get_keyrings(['--list-options', 'show-keyring', '--list-keys'],
+                  keyrings)
+    _get_keyrings(['--list-options', 'show-keyring', '--list-secret-keys'],
+                  keyrings)
 
-    writeable = any([os.access(file, os.W_OK) for file in keyrings])
-    return (writeable, keyrings)
+    return keyrings
 
 
 def error_exit(message, code=1, log_level=None):
@@ -843,7 +917,26 @@ def error_exit(message, code=1, log_level=None):
         log_level(message)
     if code == 1:
         print('Unable to start server')
+    print()
     sys.exit(code)
+
+
+def send_error(conn, message, log_level=None, exit_code=1):
+    """ Log an error message and send it back to the client along with exit
+    code.
+
+        Args:
+            conn (socket.socket): Socket instance.
+            message (str): Error message.
+            log_level (function): Logging severity level method, e.g.
+                logging.error.
+            exit_code (int): Exit code to be generated by the client.
+    """
+    if log_level:
+        log(message, log_level)
+    message = 'GPG Remote Server: ' + message
+    package = pack(PACKAGE_ERROR, message, exit_code)
+    send(*package, conn=conn)
 
 
 def log(message, log_level):
@@ -859,52 +952,339 @@ def log(message, log_level):
     log_level('{}: {}'.format(thread, message) if thread else message)
 
 
-def send_socket(socket_file, socket_descriptor, stop):
-    """ Background task to send client socket descriptor to a pinentry
-    process listening on an IPC socket.
+class AnyBase(object):
+    """ Generate string representation of an integer or a bytes array with
+    arbitrary base and provided encoding alphabet.
 
-        Args:
-            socket_file (str): IPC UNIX socket filepath.
-            socket_descriptor (socket.socket): Opened TCP socket instance.
-            stop (threading.Event): Stop IPC thread flag.
+        The implementation is poorly optimized, has subexponential
+        complexity, and should be used for short data only (preferrably,
+        less than 2 ** 12 bytes), otherwise processing time is likely to be
+        excessive.
+
+        The encoding scheme works as follows. First, if the input data is
+        bytes starting with a null-byte, the first byte is replaced with
+        armoring value (in order to preserve the bytes array on the next
+        step). Then input is converted to integer which is encoded with the
+        provided alphabet using modular arithmetics and iterative division
+        operations; a marker of leading null-byte (if it were present) is
+        prepended to the beginning of an encoded string. At this point the
+        encoding string may have varying length depending on the input
+        value (e.g. 0x000000 vs 0xffffff). This is dealt with in "strict
+        length" mode (the default) by prepending the string with at least
+        one more character denoting (by its index value in the encoding
+        alphabet) the length of padding required to make the encoded output
+        length fixed regardless of input value (for a given input length of
+        course); the same character is then used as the actual padding if
+        additional padding is required. The encoded output conforms to the
+        following format:
+
+        [<p> [p ...]] [n] <e ...>
+
+        where p is the padding value (in "strict length" mode only), n is
+        the leading null-byte marker, and e is the encoded data contents.
+
+        Attributes:
+            BASE62 (str): Predefined 62 characters long alphanumeric
+                alphabet. Inflation ratio is 1.349.
     """
-    wait = IPC_POLL
-    waiting = 0
-    # Compare timestamp in order to send IPC data only once per IPC socket.
-    ipc_timestamp = None
 
-    while waiting < CONFIG['gpg_timeout']:
-        waiting += wait
-        time.sleep(wait)
+    __null_armor = ord('\x01')
+    BASE62 = '0123456789abcdefghijklmnopqrstuvwxyz' \
+             'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
-        if stop.is_set():
-            break
+    def __init__(self, alphabet=None, strict_len=True, to_int=False):
+        """ Constructor.
 
-        if not os.path.exists(socket_file):
-            continue
-        socket_timestamp = os.stat(socket_file).st_ctime
-        if socket_timestamp == ipc_timestamp:
-            continue
-        else:
-            ipc_timestamp = socket_timestamp
+            Args:
+                alphabet (str): Encoding alphabet. An encoded output will
+                    be a base-N representation of input data, where N is
+                    the length of alphabet. The first character is reserved
+                    as a marker for a special case of preserving leading
+                    null-bytes of the input. Consequently, an alphabet may
+                    not be less than 3 characters long (effectively making
+                    a binary coding) when not in "strict length" mode, or
+                    6 characters otherwise (due to padding). Base-62 is
+                    used by default.
+                strict_len (bool, int): For bytes array input only: encode
+                    to a string of fixed length for a given input length
+                    regardless of input value. If False, the inflation
+                    ratio is slightly lower, but encoded output length may
+                    vary by a few characters depending on the input and
+                    encoding alphabet used.
+                to_int (bool): Output decoded data as integer instead of
+                    bytes array.
+        """
+        alphabet = alphabet or self.BASE62
+        self.leading_null = None
+        self.to_int = to_int
+        self.strict_len = strict_len
+        self.alphabet = list(alphabet)
+        self.null_marker = self.alphabet.pop(0)
+        self.base = len(self.alphabet)
 
+    def _len_encoded(self, length):
+        """Return maximum length of encoded string given the input bytes
+        array length."""
+        return math.ceil(math.log(256 ** length, self.base))
+
+    def _len_decoded(self, length):
+        """Return maximum length of decoded bytes array given the encoded
+        string length."""
+        return math.ceil(math.log(self.base ** length, 256))
+
+    def _bytes_to_int(self, bytes_array):
+        """Return an integer representation of the provided bytes array."""
+        self.leading_null = bytes_array[0] == 0
+        if self.leading_null:
+            bytes_array[0] = self.__null_armor
+        return int.from_bytes(bytes_array, 'big')
+
+    def _int_to_bytes(self, n, max_len):
+        """Return the bytes array represented by an integer. 'max_len'
+        argument defines the length of output buffer."""
+        output = bytearray(n.to_bytes(max_len, 'big')).lstrip(b'\x00')
+        if self.leading_null:
+            # Restore the original null-byte.
+            output[0] = ord('\x00')
+        return bytes(output)
+
+    def _encode_int(self, n, max_len=None):
+        """Encode integer into a string. If max_len is provided, strict_len
+        mode is assumed, and the output is padded to the given length."""
+        # Encoding procedure.
+        output = []
+        while n:
+            output.insert(0, self.alphabet[n % self.base])
+            n //= self.base
+        # Prepend null-byte marker.
+        if self.leading_null:
+            output.insert(0, self.null_marker)
+        # In "strict length" mode, add length padding.
+        if max_len is not None:
+            padding_len = max_len - len(output) + 1
+            padding = [self.alphabet[padding_len]] * padding_len
+            output = padding + output
+        return ''.join(output)
+
+    def _decode_str(self, string):
+        """Decode string into an integer. Returns a tuple of decoded value
+        and the maximum length of decoded payload."""
+        self.leading_null = False
+        index_table = {char: idx for idx, char in enumerate(self.alphabet)}
+        string = list(string)
+        # Strip padding.
+        if self.strict_len and not self.to_int:
+            padding_len = index_table[string[0]]
+            string = string[padding_len:]
+        # Strip null-byte marker.
+        if string[0] == self.null_marker:
+            self.leading_null = True
+            string = string[1:]
+        # Decoding procedure.
+        output = 0
+        for i, char in enumerate(string[::-1]):
+            output += index_table[char] * (self.base ** i)
+        return output, self._len_decoded(len(string))
+
+    def encode(self, data):
+        """ Encode a input data.
+
+            Args:
+                data (int, bytes): Input data.
+
+            Returns:
+                (str) Encoded output.
+
+            Raises:
+                TypeError: On illegal input type.
+        """
+        if not isinstance(data, (int, bytes)):
+            raise TypeError('value to encode must be int or bytes')
+        max_len = None
+        if isinstance(data, bytes):
+            max_len = self._len_encoded(len(data))
+            data = self._bytes_to_int(bytearray(data))
+        return self._encode_int(data, max_len if self.strict_len else None)
+
+    def decode(self, encoded):
+        """ Decode an encoded string.
+
+            The alphabet and output parameters must be identical to those
+            used for encoding operation, otherwise decoding will produce
+            wrong result.
+
+            Args:
+                encoded (str): Encoded data.
+
+            Returns:
+                (bytes, int): Decoded data.
+
+            Raises:
+                TypeError: On illegal input type.
+        """
+        if not isinstance(encoded, str):
+            raise TypeError('value to decode must be a string')
+        n, max_len = self._decode_str(encoded)
+        return self._int_to_bytes(n, max_len) if not self.to_int else n
+
+
+class IPCServer(UnixStreamServer):
+    """ Single-threaded IPC server for GPG Remote Server <> Pinentry
+    process communication.
+
+        All not explicitly mentioned attributes have standard meaning from
+        socketserver.BaseServer.
+
+        Attributes:
+            terminate (bool): Stop server flag. Can be used from handler
+                threads to signal graceful shutdown.
+            auth_key (bytes): IPC session authentication key.
+            client_conn (socket.socket): Opened TCP socket instance of a
+                client connection.
+            panic_rules (dict): "Panic" rules provided to pinentry.
+            panic_env (dict): Environment variables for "panic" commands.
+            stop (threading.Event): Stop server command trigger.
+            main_server (weakref.ref): A weak reference to the main GPG
+                Remote server instance.
+    """
+
+    timeout = IPC_TIMEOUT
+
+    terminate = False
+    auth_key = None
+    client_conn = None
+    panic_rules = None
+    panic_env = None
+    stop = None
+    main_server = None
+
+    def service_actions(self):
+        """Stop server if signalled from a handler thread."""
+        if self.terminate:
+            self.shutdown()
+
+
+class IPCHandler(BaseRequestHandler):
+    """ Server <> Pinentry IPC requests handler.
+
+        Error handling and reporting is minimal, IPC server thread can be
+        safely crashed in most cases.
+    """
+
+    def handle(self):
+        """Dispatch IPC request."""
         try:
-            sock = socket.socket(socket.AF_UNIX,
-                                 socket.SOCK_STREAM)
-            sock.connect(socket_file)
-            log('IPC connection established, passing socket descriptor',
+            identifier, *request = unpack(receive(self.request,
+                                                  len_limit=IPC_SIZE_LIMIT),
+                                          auth_key=self.server.auth_key)
+            handle_request = getattr(self, 'handle_request_' + identifier)
+            log('IPC request type received: "{}"'.format(identifier),
                 logging.debug)
-            sock.sendmsg([b'client_socket'],
-                         [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                           array.array("i", [socket_descriptor.fileno()]))])
-            log('IPC data sent successfully', logging.debug)
-        except:
-            log('IPC connection or data transmission failed', logging.debug)
-        finally:
-            try:
-                sock.close()
-            except:
-                pass
+            handle_request(*request)
+        except Exception as exc:
+            if isinstance(exc, AttributeError):
+                log('Unknown IPC request type received: "{}"'.
+                    format(identifier), logging.error)
+            elif isinstance(exc, AuthenticationError):
+                log('IPC request verification failed', logging.error)
+
+    def handle_request_init(self, *data):
+        """ Process 'init' type request package.
+
+            Provides pinentry process with the following data in response:
+            client socket descriptor, GPG execution timeout value, "panic"
+            options definitions, and environment variables for "panic"
+            commands. The actual response consists of two subsequent
+            transmissions: the first one, carrying client socket, uses
+            socket.sendmsg() method; the second one uses regular GPG Remote
+            transmission protocol to transfer the rest of the data.
+
+            Args:
+                data (list): Package contents returned by unpack() with
+                    identifier element discarded. Package is assumed to be
+                    empty and is ignored, as the request is only to signal
+                    readiness for init data receiving.
+        """
+        conn = self.request
+
+        # Sending client socket descriptor. There seems to be no way to
+        # authenticate ancillary buffer (it'll be modified by kernel in
+        # transit), but at least lets authenticate the source.
+        descriptor = [self.server.client_conn.fileno()]
+        _, package = pack(PACKAGE_INIT, descriptor[0],
+                          auth_key=self.server.auth_key)
+        conn.sendmsg([package.read()],
+                     [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                       array.array("i", descriptor))])
+
+        # Sending remaining data.
+        data = [CONFIG['gpg_timeout'], self.server.panic_rules,
+                self.server.panic_env]
+        package = pack(PACKAGE_INIT, *data, auth_key=self.server.auth_key)
+        send(*package, conn=self.request)
+
+        log('IPC init data sent successfully', logging.debug)
+
+    def handle_request_panic(self, *data):
+        """ Process 'panic' type request package.
+
+            Args:
+                data (list): Package contents returned by unpack() with
+                    identifier element discarded. Package is assumed to
+                    contain triggered "panic" rule name and exit code of
+                    an executed command.
+        """
+        fields, _ = data
+        name, code = fields
+        log('"Panic" rule triggered: {}. Command exited with code {}'.
+            format(name, code), logging.critical)
+
+    def handle_request_command(self, *data):
+        """ Dispatch IPC command received with 'command' type request
+        package.
+
+            Args:
+                data (list): Package contents returned by unpack() with
+                    identifier element discarded. Package contents consists
+                    of triggered "panic" rule name and server IPC command
+                    name.
+        """
+        fields, _ = data
+        name, command = fields
+        try:
+            handle_command = getattr(self, 'handle_command_' +
+                                     command.lower())
+            log('"Panic" rule triggered: {}. Calling server command: {}'.
+                format(name, command), logging.critical)
+            handle_command()
+        except AttributeError:
+            log('Unknown server command received: "{}"'.
+                format(command), logging.error)
+
+    @classmethod
+    def get_commands(cls):
+        """Return a list of defined command names."""
+        return [name.rpartition('_')[2].upper() for name in dir(cls)
+                if name.startswith('handle_command_')]
+
+    def handle_command_stop(self, *data):
+        """Execute STOP command. Send stub error response to the client and
+        perform graceful server shutdown."""
+        log('Stopping server', logging.info)
+        send_error(self.server.client_conn, 'Undefined error')
+
+        self.server.terminate = True
+        self.server.stop.set()
+
+        main_server = self.server.main_server()
+        main_server.terminate = True
+        main_server.socket.close()
+        os.kill(main_server.pid, signal.SIGTERM)
+
+    def handle_command_kill(self, *data):
+        """Execute KILL command. Send SIGKILL to the server process."""
+        log('Terminating server', logging.critical)
+        os.kill(self.server.main_server().pid, signal.SIGKILL)
 
 
 class ThreadingPoolMixIn(ThreadingMixIn):
@@ -921,23 +1301,40 @@ class ThreadingPoolMixIn(ThreadingMixIn):
 
 
 class Server(ThreadingPoolMixIn, TCPServer):
-    """ Forking TCP server which will do all the requests handling stuff.
+    """ GPG Remote forking TCP server which will do all the client gpg
+    requests handling stuff.
 
         All not explicitly mentioned attributes have standard meaning from
         socketserver.BaseServer.
 
         Attributes:
+            terminate (bool): Stop server flag. Can be used from handler
+                threads to signal graceful shutdown.
             pool (concurrent.futures.ThreadPoolExecutor): Concurrent
                 tasks pool.
             queue_len (int): The number of requests currently registered
                 in the server queue.
+            pid (int): Server PID.
+            gpg_argv (list): Pathname of GPG executable along with default
+                command line arguments if necessary.
+            panic_rules (dict): "Panic" rules provided to pinentry.
+            keyrings (str): Space-separated list of GPG keyring files
+                detected by the server.
+            whitelist (list): Parsed GPG command line options whitelist.
     """
 
+    allow_reuse_address = False
+    timeout = None
+
+    terminate = False
     pool = None
     queue_len = 0
     request_queue_size = 2
-    allow_reuse_address = False
-    timeout = None
+    pid = None
+    gpg_argv = None
+    panic_rules = {}
+    keyrings = ''
+    whitelist = None
 
     def verify_request(self, request, client_address):
         """Deny access if requests queue is full."""
@@ -945,26 +1342,23 @@ class Server(ThreadingPoolMixIn, TCPServer):
                             or self.queue_len < self.request_queue_size
         if not allowed:
             log('Queue overflow, request handling denied', logging.info)
-            # Signalling an error to the client using low-level interface.
-            message = 'GPG Remote Server: Connection refused. ' \
-                                            'Too many requests'
-            length, package = pack(PACKAGE_ERROR, message, 1)
-            send(length, package, request)
+            message = 'Connection refused. Too many requests'
+            send_error(request, message, exit_code=1)
 
         return allowed
 
+    def service_actions(self):
+        """Stop server if signalled from a handler thread."""
+        if self.terminate:
+            self.shutdown()
+
 
 class Handler(BaseRequestHandler):
-    """ Requests handler.
+    """ GPG Remote Server requests handler.
 
         Attributes:
-            pid (int): Server PID.
             cwd (tempfile.TemporaryDirectory): Temporary working for
                 gpg execution.
-            gpg_argv (list): Pathname of GPG executable along with default
-                command line arguments if necessary.
-            panic_rules (dict): "Panic" rules provided to pinentry.
-            whitelist (list): Parsed GPG command line options whitelist.
             tempdirs (dict): Input filenames mapping to their temporary
                 directories storage.
             files_received (int): The number of input files received from
@@ -973,32 +1367,14 @@ class Handler(BaseRequestHandler):
                 may be returned if it's True.
     """
 
-    pid = None
     cwd = None
-    gpg_argv = None
-    panic_rules = {}
-    whitelist = None
     tempdirs = None
     files_received = None
     no_files = False
 
-    def send_error(self, message, log_level=None, exit_code=1, _conn=None):
-        """ Log an error message and send it back to the client along with
-        exit code.
-
-            Args:
-                message (str): Error message.
-                log_level (function): Logging severity level method, e.g.
-                    logging.error.
-                exit_code (int): Exit code to be generated by the client.
-                _conn (socket.socket): Socket instance if needs to be
-                    overridden.
-        """
-        if log_level:
-            log(message, log_level)
-        message = 'GPG Remote Server: ' + message
-        length, package = pack(PACKAGE_ERROR, message, exit_code)
-        send(length, package, _conn or self.request)
+    def send_error(self, *args, **kwargs):
+        """A shortcut for send_error() with conn=self.request."""
+        send_error(self.request, *args, **kwargs)
 
     def filter_args(self, args):
         """ Run command line arguments filters and set no_files flag.
@@ -1011,9 +1387,10 @@ class Handler(BaseRequestHandler):
         """
         strict = CONFIG['strict']
         filtered_opts = filter_parameters(filter_options(
-                                             args, self.whitelist, strict),
-                                          self.whitelist, strict)
-        self.no_files = get_no_files_flag(filtered_opts, self.whitelist)
+                                    args, self.server.whitelist, strict),
+                                          self.server.whitelist, strict)
+        self.no_files = get_no_files_flag(filtered_opts,
+                                          self.server.whitelist)
 
         return filtered_opts
 
@@ -1226,44 +1603,52 @@ class Handler(BaseRequestHandler):
                     safe_args = self.replace_args_filepaths(filtered_args,
                                                             output_file)
 
-                gpg_argv = self.gpg_argv + flatten_args(safe_args)
+                gpg_argv = self.server.gpg_argv + flatten_args(safe_args)
                 log('Invoking GPG process with shell tokens: {}'.
                     format(gpg_argv), logging.info)
 
                 # Opportunistically pass socket descriptor to the custom
                 # pinentry application. For a standard pinentry this should
-                # have no effect, i.e. nothing will be sent.
+                # have no effect as it won't initiate IPC protocol.
                 socket_dir = tempfile.mkdtemp(dir=CONFIG['tempdir'],
                                               prefix=TEMP_PREFIX)
                 socket_file = os.path.join(socket_dir, IPC_SOCKET)
-                log('Expecting pinentry IPC socket as "{}" file'.
+                os.chmod(socket_dir, 493)  # A.k.a. ugo=rx,u+w, or 0755
+                log('Starting IPC server listening on "{}"'.
                     format(socket_file), logging.debug)
-                stop_ipc = threading.Event()
-                ipc_thread = threading.Thread(target=send_socket,
-                                              args=(socket_file,
-                                                    self.request,
-                                                    stop_ipc))
+
+                # Instantiating IPC server.
+                ipc = IPCServer(socket_file, IPCHandler)
+                ipc.client_conn = self.request
+                ipc.auth_key = os.urandom(IPC_KEY_LEN)
+                ipc.panic_rules = self.server.panic_rules
+                ipc.panic_env = {'GPG_REMOTE_PID': str(self.server.pid)}
+                ipc.stop = threading.Event()
+                ipc.main_server = weakref.ref(self.server)
+
+                # Starting IPC server.
+                ipc_thread = threading.Thread(target=ipc.serve_forever,
+                                      kwargs={'poll_interval': IPC_POLL})
                 ipc_thread.daemon = True
                 ipc_thread.start()
+                os.chmod(socket_file, 511)  #A.k.a. ugo=rwx, or 0777
                 log('IPC thread started as {}'.format(ipc_thread.name),
                     logging.debug)
 
                 # Update environment with pinentry IPC data consisting of
-                # JSON-encoded list of the following elements: application
-                # version, GPG timeout value, panic options, environment
-                # variables for panic commands, path to IPC socket, path to
-                # gpg-remote server directory and gpg-remote server module
-                # name. The two last elements will be used to import data
-                # transmission functions from the current module.
+                # the following colon-separated elements: application
+                # version, IPC authentication key (Base62-encoded), path to
+                # IPC socket, path to gpg-remote server directory,
+                # gpg-remote server module name. The two last elements will
+                # be used to import data transmission functions from the
+                # current module.
                 module_path = os.path.split(os.path.abspath(__file__))
                 module_dir = module_path[0]
                 module_name = os.path.splitext(module_path[1])[0]
-                panic_env = {'GPG_REMOTE_PID': str(self.pid)}
-                ipc_data = [__version__, CONFIG['gpg_timeout'],
-                            self.panic_rules, panic_env,
+                ipc_data = [__version__, AnyBase().encode(ipc.auth_key),
                             socket_file, module_dir, module_name]
                 env = os.environ.copy()
-                env['PINENTRY_USER_DATA'] = json.dumps(ipc_data)
+                env['PINENTRY_USER_DATA'] = ':'.join(ipc_data)
 
                 # Call gpg.
                 with Popen(gpg_argv, stdin=PIPE, stdout=PIPE, stderr=PIPE,
@@ -1276,6 +1661,11 @@ class Handler(BaseRequestHandler):
                     exit_code = gpg.returncode
                     log('GPG process terminated with exit code {}'.
                         format(exit_code), logging.info)
+
+                # Terminate request handling on STOP command.
+                if ipc.stop.is_set():
+                    self.request.shutdown(socket.SHUT_RDWR)
+                    return
 
                 # Collect new files.
                 if self.no_files:
@@ -1290,15 +1680,13 @@ class Handler(BaseRequestHandler):
 
                 # Send response.
                 out_files[None] = stdout
-                length, package = pack(PACKAGE_GPG,
-                                       stderr.decode(errors='ignore'),
-                                       exit_code, files=out_files)
-                send(length, package, self.request)
+                package = pack(PACKAGE_GPG,
+                               stderr.decode(errors='ignore'),
+                               exit_code, files=out_files)
+                send(*package, conn=self.request)
                 log('Response package sent successfully', logging.debug)
 
-            except handle_exc(RestrictedError, AmbiguousError,
-                              MalformedArgsError, FilePackageError,
-                              PackageError, TimeoutExpired) as exc:
+            except handle_exc() as exc:
                 if isinstance(exc, RestrictedError):
                     self.send_error('Cannot invoke GPG with restricted '
                                     'option/parameter: {}'.
@@ -1320,25 +1708,26 @@ class Handler(BaseRequestHandler):
                     self.send_error('General package error. Probably the '
                                     'amount of files received does not '
                                     'match the expected number',
-                                    logging.error, exit_code=1)
+                                    logging.error)
                 elif isinstance(exc, TimeoutExpired):
                     try:
                         gpg.kill()
                     except:
                         pass
-                    self.send_error('GPG process timed out',
-                                    logging.error, exit_code=1)
+                    self.send_error('GPG process timed out', logging.error)
+                else:
+                    self.send_error('Undefined error', logging.error)
             finally:
                 try:
-                    stop_ipc.set()
-                    ipc_thread.join(IPC_POLL)
-                    log('IPC thread stopped', logging.debug)
-                    if os.path.exists(socket_file):
-                        os.remove(socket_file)
+                    if not ipc.terminate:
+                        ipc.shutdown()
+                        ipc_thread.join(IPC_POLL)
+                    os.remove(socket_file)
                     os.rmdir(socket_dir)
+                    log('IPC thread stopped', logging.debug)
                 except:
                     pass
-        except handle_exc(TypeError, ValueError, AttributeError) as exc:
+        except handle_exc() as exc:
             raise RequestError
 
     def handle(self):
@@ -1357,10 +1746,7 @@ class Handler(BaseRequestHandler):
 
             handle_request(*request)
 
-        except handle_exc(AttributeError, RequestError,
-                          TypeError, ValueError, TransmissionError,
-                          BrokenPipeError, StreamLenError,
-                          VersionMismatchError) as exc:
+        except handle_exc() as exc:
             if isinstance(exc, AttributeError):
                 self.send_error('Unknown request type received from '
                                 'GPG Remote client', logging.error)
@@ -1384,6 +1770,8 @@ class Handler(BaseRequestHandler):
                 # would couse the same error on the other end.
                 log('Request version mismatch: server {}, client {}'.
                     format(__version__, exc.args[0]), logging.error)
+            else:
+                self.send_error('Undefined error', logging.error)
         finally:
             # Properly clean up temporary directory.
             try:
@@ -1437,40 +1825,43 @@ if __name__ == '__main__':
                                                 CONFIG['whitelist_path']))
     try:
         with open(whitelist_path, 'r') as file:
-            Handler.whitelist = parse_whitelist(file.readlines())
+            Server.whitelist = parse_whitelist(file.readlines())
             log('Parsed whitelist file "{}"'.format(whitelist_path),
                 logging.info)
             log('Total options whitelisted: {}'.
-                format(len(Handler.whitelist)), logging.debug)
+                format(len(Server.whitelist)), logging.debug)
     except:
         error_exit('Unable to read or parse whitelist file "{}"'.
                    format(whitelist_path), log_level=logging.critical)
 
-    Handler.gpg_argv = shlex.split(CONFIG['gpg_exec'])
-    log('Default GPG invocation tokens: {}'.format(Handler.gpg_argv),
+    Server.gpg_argv = shlex.split(CONFIG['gpg_exec'])
+    log('Default GPG invocation tokens: {}'.format(Server.gpg_argv),
         logging.debug)
 
+    try:
+        keyrings = get_keyrings(Server.gpg_argv)
+        Server.keyrings = ' '.join([shlex.quote(file) for file in keyrings])
+    except FileNotFoundError:
+        error_exit('GPG executable "{}" not found'.
+                   format(Server.gpg_argv[0]),
+                   log_level=logging.critical)
+
     if not CONFIG['unsafe']:
-        try:
-            writeable, keyrings = keyrings_writeable(Handler.gpg_argv)
-            log('GPG keyrings checked for write access: {}'.
-                format(', '.join(keyrings)), logging.info)
-            if writeable:
-                error_exit('The current user has write access to some of '
-                           'GPG keyrings. GPG Remote Server cannot protect '
-                           'from the client adding keys to the keyring. '
-                           'Either take steps to make keyring files '
-                           'read-only, or start the server with --unsafe '
-                           'option', log_level=logging.critical)
-            else:
-                log('Checked keyrings are read-only for the current user. '
-                    'Note: This check cannot detect empty keyrings. Make '
-                    'sure no empty keyring files are defined in gpg '
-                    'configuration or invocation options', logging.info)
-        except FileNotFoundError:
-            error_exit('GPG executable "{}" not found'.
-                       format(Handler.gpg_argv[0]),
+        log('GPG keyrings checked for write access: {}'.
+            format(', '.join(keyrings) if keyrings else 'none found'),
+            logging.info)
+        if any([os.access(file, os.W_OK) for file in keyrings]):
+            error_exit('The current user has write access to some of GPG '
+                       'keyrings. GPG Remote Server cannot protect from '
+                       'the client adding keys to the keyring. Either take '
+                       'steps to make keyring files read-only, or start '
+                       'the server with --unsafe option',
                        log_level=logging.critical)
+        else:
+            log('Checked keyrings are read-only for the current user. '
+                'Note: This check cannot detect empty keyrings. Make sure '
+                'no empty keyring files are defined in gpg configuration '
+                'or invocation options', logging.info)
     else:
         log('Safety checks disabled', logging.critical)
 
@@ -1479,12 +1870,12 @@ if __name__ == '__main__':
         error_exit('Queue size value cannot be less the number '
                    'of threads', log_level=logging.critical)
 
-    Handler.panic_rules = get_panic_cmds(CONFIG)
-    if Handler.panic_rules:
-        log('"Panic" rules enabled:\n{}'.
-            format('\n'.join(['   {}: {}'.format(name, item[1])
+    Server.panic_rules = get_panic_cmds(CONFIG)
+    if Server.panic_rules:
+        log('"Panic" rules enabled: {}'.
+            format(', '.join(['"{}: {}"'.format(name, item[1])
                               for name, item
-                              in Handler.panic_rules.items()])),
+                              in Server.panic_rules])),
             logging.info)
 
     log('Strict mode {}'.format('enabled' if CONFIG['strict']
@@ -1512,9 +1903,9 @@ if __name__ == '__main__':
         error_exit('Listening address:port already in use',
                    log_level=logging.critical)
 
-    Handler.pid = os.getpid()
+    Server.pid = os.getpid()
     log('Server started as PID {}. Listening on {}:{}'.
-        format(Handler.pid, CONFIG['host'], CONFIG['port']), logging.info)
+        format(Server.pid, CONFIG['host'], CONFIG['port']), logging.info)
 
     try:
         def sigterm_handler(signum, frame):

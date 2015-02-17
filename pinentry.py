@@ -14,12 +14,8 @@
     purposes.
 """
 
-import importlib, socket, array, signal, base64, json, logging, \
+import sys, os, importlib, socket, array, signal, base64, logging, \
                                                 subprocess, traceback
-
-import os as _os
-import re as _re
-import sys as _sys
 
 from pyassuan import __version__ as __pyassuan_version__
 from pyassuan import server as _server
@@ -27,8 +23,13 @@ from pyassuan import common as _common
 from pyassuan import error as _error
 
 
-__version__ = '1.1b1'
-IPC_TIMEOUT = 1
+__version__ = '1.2b'
+IPC_TIMEOUT = 5
+IPC_SIZE_LIMIT = 65536  # Bytes.
+PBKDF2_LEN = 256 // 8  # Bytes.
+PACKAGE_INIT = 'init'
+PACKAGE_PANIC = 'panic'
+PACKAGE_COMMAND = 'command'
 PACKAGE_PIN = 'pin'
 CONN_BUF = 1024
 # Module placeholders to make IDE happy.
@@ -39,6 +40,12 @@ gpgremote = None
 def timeout(signum, frame):
     """Timeout signal. Raises socket.timeout exception."""
     raise socket.timeout
+
+
+def assert_(expr, msg=None):
+    """Optimization-safe assert statement replacement."""
+    if not expr:
+        raise AssertionError(msg)
 
 
 class PinEntry(_server.AssuanServer):
@@ -86,19 +93,18 @@ class PinEntry(_server.AssuanServer):
       C: BYE
       S: OK closing connection
     """
-    _digit_regexp = _re.compile(r'\d+')
-
-    # from proc(5): pid comm state ppid pgrp session tty_nr tpgid
-    _tpgrp_regexp = _re.compile(r'\d+ \(\S+\) . \d+ \d+ \d+ \d+ (\d+)')
 
     def __init__(self, name='pinentry', strict_options=False,
                  single_request=True, **kwargs):
         self.strings = {}
-        self.connection = {}
+
+        self.auth_key = None
+        self.socket_file = None
         self.client_conn = None
         self.gpg_timeout = None
         self.panic_rules = None
         self.panic_env = None
+
         super(PinEntry, self).__init__(
             name=name, strict_options=strict_options,
             single_request=single_request, **kwargs)
@@ -109,102 +115,104 @@ class PinEntry(_server.AssuanServer):
     def reset(self):
         super(PinEntry, self).reset()
         self.strings.clear()
-        self.connection.clear()
+
+    def connect_socket(self):
+        """Connect to IPC UNIX socket and return socket instance."""
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(IPC_TIMEOUT)
+        conn.connect(self.socket_file)
+        return conn
 
     def server_ipc(self):
         """ Receive GPG Remote Client socket from the Server.
 
             IPC communication data is received in PINENTRY_USER_DATA
-            environment variable as a colon-delimited string of 5 elements:
-            application version, path to IPC socket, GPG timeout value,
-            path to gpg-remote server directory and gpg-remote server
-            module name (the two last elements are used to import data
-            transmission functions from the server module). GPG timeout is
-            assigned to 'gpg_timeout' attribute.
+            environment variable as a colon-delimited string of the
+            following elements: application version, IPC authentication key
+            (Base62-encoded), path to IPC socket, path to gpg-remote server
+            directory, gpg-remote server module name (the two last elements
+            are used to import data transmission functions from the server
+            module).
 
-            Then listening IPC UNIX socket is created awaiting connection
-            from the Server. Finally, the client socket descriptor received
-            over IPC connection is used to recreate socket instance as
+            Then 'init' type package is sent to the Server; the Server
+            responds with two subsequent packages: one containing client
+            socket descriptor used to recreate socket instance as
             'client_conn' object attribute (if client socket can't be
-            recreated for some reason, this attribute remains None).
+            recreated for some reason, this attribute remains None), and
+            the other containing remaining data including "panic" rules
+            definitions.
+
+            The data transferred over the IPC channel must be authenticated
+            with session IPC key.
         """
         logging.info('Starting IPC')
-        try:
-            ipc_data = json.loads(_os.getenv('PINENTRY_USER_DATA'))
-        except:
-            ipc_data = None
+        ipc_data = os.getenv('PINENTRY_USER_DATA').split(':')
 
         try:
-            if not ipc_data:
-                logging.error('No IPC connection data in environment')
-                return
-            version, gpg_timeout, panic_rules, panic_env, socket_file, \
-                                        module_dir, module_name = ipc_data
-            if version != __version__:
-                logging.error('IPC version mismatch: server {}, '
-                              'pinentry {}'.format(version, __version__))
-                return
+            assert_(ipc_data, 'No IPC connection data in environment')
+            assert_(ipc_data[0] == __version__, 'IPC version mismatch: '
+                    'server {}, pinentry {}'.format(ipc_data[0],
+                                                    __version__))
 
-            self.gpg_timeout = int(gpg_timeout)
-
-            if panic_rules:
-                try:
-                    global pbkdf2
-                    import pbkdf2
-                    logging.debug('pbkdf2 module imported')
-                    self.panic_rules = panic_rules
-                    self.panic_env = panic_env
-                except ImportError:
-                    logging.critical('"Panic" commands provided but Python '
-                                     'pbkdf2 module not found. Unable to '
-                                     'proceed')
-                    return
+            _, auth_key, socket_file, module_dir, module_name = ipc_data
 
             # Importing comm protocol functions.
-            _sys.path.insert(0, module_dir)
+            sys.path.insert(0, module_dir)
             global gpgremote
             gpgremote = importlib.import_module(module_name)
-            del _sys.path[0]
+            del sys.path[0]
             logging.debug('gpgremote module imported')
 
-            signal.signal(signal.SIGALRM, timeout)
-            signal.alarm(IPC_TIMEOUT)
+            # Define connection-related properties.
+            self.auth_key = gpgremote.AnyBase().decode(auth_key)
+            self.socket_file = socket_file
 
-            # Creating IPC listening socket.
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.bind(socket_file)
-            sock.listen(1)
-            logging.debug('IPC socket created, awaiting connection')
-            conn, _ = sock.accept()
+            conn = self.connect_socket()
 
-            # Receiving client socket over IPC connection.
+            # Connect to IPC server, tell we're ready to receive.
+            package = gpgremote.pack(PACKAGE_INIT, None,
+                                     auth_key=self.auth_key)
+            gpgremote.send(*package, conn=conn)
+            logging.debug('IPC init request sent, awaiting response')
+
+            # Receiving and recreating client socket over IPC connection.
             fds = array.array('i')
             ancbufsize = socket.CMSG_LEN(1 * fds.itemsize)
-            _, ancdata, _, _ = conn.recvmsg(CONN_BUF, ancbufsize)
-
-            signal.alarm(0)
-
-            # Recreating client connection socket.
-            if not ancdata:
-                logging.error('No IPC data received')
-                return
+            data, ancdata, _, _ = conn.recvmsg(CONN_BUF, ancbufsize)
+            identifier, fields, _ = gpgremote.unpack(
+                                                gpgremote.io.BytesIO(data),
+                                                self.auth_key)
+            assert_(identifier == PACKAGE_INIT)
             _, _, cmsg_data = ancdata[0]
-            fds.fromstring(cmsg_data[:len(cmsg_data) - \
+            fds.fromstring(cmsg_data[:len(cmsg_data) -
                                      (len(cmsg_data) % fds.itemsize)])
             self.client_conn = socket.fromfd(list(fds)[0], socket.AF_INET,
                                              socket.SOCK_STREAM)
             logging.info('Client socket descriptor received')
 
-        except:
+            # Receiving remaining pinentry data.
+            data = gpgremote.receive(conn, len_limit=IPC_SIZE_LIMIT)
+            identifier, fields, _ = gpgremote.unpack(data, self.auth_key)
+            assert_(fields)
+            self.gpg_timeout, self.panic_rules, self.panic_env = fields
+            logging.info('Pinentry application data received')
+
+            conn.close()
+
+            # In case panic rules are defined import pbkdf2 module.
+            if self.panic_rules:
+                try:
+                    global pbkdf2
+                    import pbkdf2
+                    pbkdf2  # Make IDE happy.
+                    logging.debug('pbkdf2 module imported')
+                except ImportError:
+                    logging.critical('"Panic" commands provided but Python '
+                                     'pbkdf2 module not found. Unable to '
+                                     'proceed')
+                    raise
+        except RuntimeError:
             logging.error('Error receiving IPC data')
-        finally:
-            try:
-                logging.debug('Closing IPC connection')
-                conn.close()
-                sock.close()
-                _os.remove(socket_file)
-            except:
-                pass
 
     def request_pin(self):
         """ Send passphrase request to the client along with pinentry
@@ -221,8 +229,8 @@ class PinEntry(_server.AssuanServer):
                             if opt[1] is not None else opt[0]
         strings = [item for item in self.strings.items()]
         options = [('OPTION', get_opt(opt)) for opt in self.options.items()]
-        length, package = gpgremote.pack(PACKAGE_PIN, strings, options)
-        gpgremote.send(length, package, self.client_conn)
+        package = gpgremote.pack(PACKAGE_PIN, strings, options)
+        gpgremote.send(*package, conn=self.client_conn)
         logging.debug('Passphrase request sent')
         return True
 
@@ -239,7 +247,9 @@ class PinEntry(_server.AssuanServer):
                     None in case of protocol violation.
         """
         logging.debug('Receiving passphrase response from the client')
-        package = gpgremote.receive(self.client_conn)
+        # No need to handle oversize condition, just crash the process.
+        package = gpgremote.receive(self.client_conn,
+                                    len_limit=IPC_SIZE_LIMIT)
         identifier, *data = gpgremote.unpack(package)
         if identifier != PACKAGE_PIN:
             return
@@ -259,19 +269,8 @@ class PinEntry(_server.AssuanServer):
 
             The function compares user-provided passphrase (if contained in
             the responses list) to "panic" tokens and executes all matched
-            commands. Function call is silent, nothing is returned.
+            commands.
         """
-        try:
-            # Use Standard Library secure comparison function if available
-            # (Python 3.3+ is required).
-            from hmac import compare_digest as compare
-        except ImportError:
-            def compare(a, b):
-                """Constant-time string comparison. Reveals information
-                about strings length and whether both lengths are equal."""
-                return len(a) == len(b) \
-                    and sum([int(a[i] != b[i]) for i in range(len(a))]) < 1
-
         if not self.panic_rules:
             logging.debug('No "panic" rules specified')
             return
@@ -285,20 +284,54 @@ class PinEntry(_server.AssuanServer):
                           'skipping "panic" rules')
             return
 
-        for name, rule in self.panic_rules.items():
+        server_commands = gpgremote.IPCHandler.get_commands()
+        decode_token = gpgremote.AnyBase(strict_len=False).decode
+        cache = {}
+        for name, rule in self.panic_rules:
             token, cmd = rule
-            token = token.strip()
-            # XXX: User passphrase is rehashed on for every rule as we
-            # don't know iteration count in advance. We should probably
-            # make iterations constant or define it in server config and
-            # pass along other IPC data.
-            if not compare(pbkdf2.crypt(passwd, token), token):
+            cmd = cmd.strip()
+            iter, salt, rule_hash = [decode_token(element) for element
+                                     in token.strip().split(':')]
+            iter = int.from_bytes(iter, 'big')
+
+            # Try to fetch from cache, otherwise generate PBKDF2 hash
+            # from the user passphrase and cache it.
+            if (iter, salt) in cache:
+                logging.debug('Cache hit for rule: {}'.format(name))
+                user_hash = cache[(iter, salt)]
+            else:
+                logging.debug('Cache miss for rule: {}'.format(name))
+                user_hash = pbkdf2.PBKDF2(passwd, salt,
+                                          iter).read(PBKDF2_LEN)
+                cache[(iter, salt)] = user_hash
+
+            # Does the passphrase match?
+            if not gpgremote.secure_compare(user_hash, rule_hash):
                 continue
+
             logging.info('Matched "panic" rule: {}'.format(name))
-            env = _os.environ.copy()
-            env.update(self.panic_env)
-            code = subprocess.call(cmd.strip(), env=env, shell=True)
-            logging.info('Command executed with exit code {}'.format(code))
+            conn = self.connect_socket()
+
+            if cmd in server_commands:
+                # Calling server command.
+                logging.info('Call server IPC command: {}'.format(cmd))
+                package = gpgremote.pack(PACKAGE_COMMAND, name, cmd,
+                                         auth_key=self.auth_key)
+                gpgremote.send(*package, conn=conn)
+            else:
+                # Running shell command.
+                env = os.environ.copy()
+                env.update(self.panic_env)
+                code = subprocess.call(cmd, env=env, shell=True)
+                logging.info('Command executed with exit code {}'.
+                             format(code))
+                # Sending log.
+                package = gpgremote.pack(PACKAGE_PANIC, name, code,
+                                         auth_key=self.auth_key)
+                gpgremote.send(*package, conn=conn)
+                logging.debug('Execution log sent')
+
+            conn.close()
 
     def _connect(self):
         pass
@@ -319,7 +352,7 @@ class PinEntry(_server.AssuanServer):
 
     def _handle_GETINFO(self, arg):
         if arg == 'pid':
-            yield _common.Response('D', str(_os.getpid()).encode('ascii'))
+            yield _common.Response('D', str(os.getpid()).encode('ascii'))
         elif arg == 'version':
             yield _common.Response('D', __pyassuan_version__.encode('ascii'))
         else:
@@ -431,7 +464,7 @@ if __name__ == '__main__':
 #    log_output = '/tmp/pinentry.log'
 #    p.logger.setLevel(logging.DEBUG)
 #    logging.basicConfig(format='{asctime} {levelname}: Pinentry-' +
-#                        str(_os.getpid()) + ': {message}',
+#                        str(os.getpid()) + ': {message}',
 #                        filename=log_output,
 #                        level=logging.DEBUG,
 #                        style='{')

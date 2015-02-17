@@ -50,12 +50,33 @@ class TestPackage(unittest.TestCase):
         """Raise error in case of version mismatch."""
         length, package = client.pack('test_id', ['foo', 'bar'])
         # Update version string in-place. The version must begin at
-        # index 10 (8-byte header + [" JSON types stuff).
-        package.seek(10)
+        # index 14 (8-byte header + [[""," contents).
+        package.seek(14)
         package.write(b'Z')
         package.seek(0)
         self.assertRaises(server.VersionMismatchError,
                           server.unpack, package)
+
+    def test_auth_pass(self):
+        """Authenticated and correctly verified contents."""
+        identifier = 'test_id'
+        fields = ['foo', 'bar', 1]
+        key = b'key'
+        length, package = client.pack(identifier, *fields, auth_key=key)
+        unpacked_id, unpacked_fields, unpacked_files = server.unpack(
+                                                    package, auth_key=key)
+        self.assertEqual(unpacked_id, identifier)
+        self.assertEqual(unpacked_fields, fields)
+        self.assertEqual(unpacked_files, {})
+
+    def test_auth_fail(self):
+        """Authenticated and contents failed to verify."""
+        identifier = 'test_id'
+        fields = ['foo', 'bar', 1]
+        key = b'key'
+        length, package = client.pack(identifier, *fields, auth_key=b'foo')
+        self.assertRaises(server.AuthenticationError,
+                          server.unpack, package, auth_key=key)
 
 
 class TestTransmission(unittest.TestCase):

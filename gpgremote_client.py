@@ -25,8 +25,8 @@
 import sys, os, json, io, socket, signal
 
 
-__version__ = '1.1b1'
-MIN_PYTHON = (3, 2)
+__version__ = '1.2b'
+MIN_PYTHON = (3, 3)
 CONFIG = {
     'host': 'localhost',
     'port': 29797,
@@ -62,6 +62,10 @@ class VersionMismatchError(GPGRemoteException):
     pass
 
 
+class AuthenticationError(GPGRemoteException):
+    pass
+
+
 class FileSystemError(GPGRemoteException):
     pass
 
@@ -80,6 +84,20 @@ class PyassuanImportError(GPGRemoteException):
 
 # This section is identical for both client and server but duplicated
 # in order to keep modules self-contained.
+
+try:
+    # Use Standard Library secure comparison function if available (with
+    # Python 3.3+) instead of own implementation.
+    from hmac import compare_digest
+    secure_compare = compare_digest  # Make IDE happy.
+except ImportError:
+    def secure_compare(a, b):
+        """Constant-time string/bytes comparison. Only reveals information
+        about values length, and whether values types and their lengths are
+        same/equal."""
+        return len(a) == len(b) and isinstance(a, type(b)) \
+                and sum([int(a[i] != b[i]) for i in range(len(a))]) < 1
+
 
 def update_config(path, storage, silent=True):
     """ Update application configuration from the conf file (if exists).
@@ -119,7 +137,7 @@ def update_config(path, storage, silent=True):
             raise ValueError
 
 
-def pack(identifier, *fields, files=None):
+def pack(identifier, *fields, files=None, auth_key=None):
     """ Prepare package for sending.
 
         Args:
@@ -127,6 +145,9 @@ def pack(identifier, *fields, files=None):
             *fields: Data fields to include in the package. Data types
                 must be JSON-compatible.
             files (dict): Mapping of files binary data to filenames.
+            auth_key (bytes): Package contents authentication key (not used
+                for binary data). Must be bool(auth_key) == True to enable
+                authentication.
 
         Returns:
             (tuple) Package ready for transmission: its length (int) and
@@ -144,9 +165,18 @@ def pack(identifier, *fields, files=None):
     length = 0
     output = io.BytesIO()
     files = files or {}
-
     files_meta = [(name, len(data)) for name, data in files.items()]
-    package = json.dumps([__version__, identifier, fields, files_meta],
+
+    hmac_local = ''
+    if auth_key:
+        import hashlib, hmac
+
+        contents = json.dumps([__version__, identifier, fields, files_meta])
+        hmac_local = hmac.new(auth_key, contents.encode(),
+                              hashlib.sha256).hexdigest()
+
+    header = [hmac_local, __version__]
+    package = json.dumps([header, identifier, fields, files_meta],
                          ensure_ascii=False, separators=(',', ':')).encode()
 
     # Writing header.
@@ -162,11 +192,14 @@ def pack(identifier, *fields, files=None):
     return length, output
 
 
-def unpack(package):
+def unpack(package, auth_key=None):
     """ Unpack received package.
 
         Args:
             package (io.BytesIO): Received package stream.
+            auth_key (bytes): Package contents authentication key (not used
+                for binary data). Must be bool(auth_key) == True to enable
+                authentication.
 
         Returns:
             (tuple) Package type identifier (str), packed fields (list),
@@ -177,20 +210,36 @@ def unpack(package):
             VersionMismatchError: In case the package was created with a
                 different application version. Packer version is passed as
                 exception's first argument.
+            AuthenticationError: In case of authenticated package
+                verification failure.
     """
     try:
         length = int.from_bytes(package.read(HEADER_LEN), 'big')
-        version, identifier, fields, files_meta = json.loads(
+        header, identifier, fields, files_meta = json.loads(
                                             package.read(length).decode())
-        if version == __version__:
-            files = {filename: package.read(length)
-                     for filename, length in files_meta}
-            return identifier, fields, files
-    except:
-        raise PackageError
+        hmac_received, version = header
 
-    # Can get here only in case of version mismatch.
-    raise VersionMismatchError(version)
+        if auth_key:
+            import hashlib, hmac
+
+            contents = json.dumps([version, identifier, fields, files_meta])
+            hmac_local = hmac.new(auth_key, contents.encode(),
+                                  hashlib.sha256).hexdigest()
+            if not secure_compare(hmac_local, hmac_received):
+                raise AuthenticationError
+
+        if version != __version__:
+            raise VersionMismatchError
+
+        files = {filename: package.read(length)
+                 for filename, length in files_meta}
+        return identifier, fields, files
+
+    except Exception as exc:
+        if isinstance(exc, (VersionMismatchError, AuthenticationError)):
+            raise
+        else:
+            raise PackageError
 
 
 def send(length, data, conn, _override_length=None):
@@ -543,8 +592,8 @@ class PackageHandler(object):
         if stdin is not None:
             files[None] = stdin
 
-        length, package = pack(PACKAGE_GPG, *args, files=files)
-        send(length, package, self.conn)
+        package = pack(PACKAGE_GPG, *args, files=files)
+        send(*package, conn=self.conn)
 
     def send_package_pin(self, responses):
         """ Prepare and send pinentry output data.
@@ -568,8 +617,8 @@ class PackageHandler(object):
                     if param is not None and command != 'ERR' else param
             data.append((command, param))
 
-        length, package = pack(PACKAGE_PIN, *data)
-        send(length, package, self.conn)
+        package = pack(PACKAGE_PIN, *data)
+        send(*package, conn=self.conn)
 
     def handle_package_gpg(self, *data):
         """ Process 'gpg' type response package.
@@ -744,19 +793,13 @@ if __name__ == '__main__':
         # Sending request to the server.
         try:
             package_handler.send_package_gpg(args, stdin, filenames)
-        except (FileSystemError, TransmissionError,
-                socket.timeout, BrokenPipeError,
-                ConnectionResetError) as exc:
+        except Exception as exc:
             error_handler(exc)
 
         # Handling server response.
         try:
             package_handler.run()
-        except (AttributeError, ResponseError, PackageError,
-                TypeError, ValueError, socket.timeout,
-                BrokenPipeError, TransmissionError,
-                ConnectionResetError, FileSystemError,
-                PyassuanImportError) as exc:
+        except Exception as exc:
             error_handler(exc)
 
     except ConnectionRefusedError:
