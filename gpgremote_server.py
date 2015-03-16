@@ -31,7 +31,7 @@
 """
 
 import sys, os, getopt, io, json, shlex, logging, tempfile, \
-        threading, signal, time, socket, array, math, weakref
+        threading, signal, socket, array, math, weakref
 from collections import OrderedDict
 from socketserver import TCPServer, UnixStreamServer, \
                         ThreadingMixIn, BaseRequestHandler
@@ -40,7 +40,7 @@ from subprocess import Popen, PIPE, DEVNULL, check_output, \
                         TimeoutExpired, CalledProcessError
 
 
-__version__ = '1.2b'
+__version__ = '1.2'
 MIN_PYTHON = (3, 3)
 CONFIG = OrderedDict({
     'host': 'localhost',
@@ -212,12 +212,16 @@ def pack(identifier, *fields, files=None, auth_key=None):
 
         The package is a structure of the following format:
 
-        header|JSON(version, identifier, fields, files_meta)|binary,
+        header|JSON([auth, version], identifier, fields, files_meta)|binary,
 
         where header is a 64-bit (8 bytes) JSON packet length header, and
         binary is a concatenated binary data of all included files.
         Filename and size of each file is included in the last item of JSON
         packet as a list of (filename, file size) 2-tuples.
+
+        Package is authenticated (if auth_key is provided) with HMAC-SHA256
+        over JSON-encoded flat list of package content elements except for
+        binary data. Auth token is in hex notation.
     """
     length = 0
     output = io.BytesIO()
@@ -515,10 +519,10 @@ def gen_token():
     """ Prompt user for a passphrase and [optional] iterations count,
     generate and print PBKDF2 token.
 
-        Token format is a string of colon-delimited encoded elements:
-        iterations count (as bytes representation), salt, hash.
+        Token format is a string of colon-delimited Base62-encoded
+        elements: iterations count (in bytes representation), salt, hash.
     """
-    import termios
+    import time, termios
     try:
         import pbkdf2
     except ImportError:
@@ -532,24 +536,28 @@ def gen_token():
     try:
         termios.tcsetattr(fd, termios.TCSADRAIN, new)
         passwd = input('Passphrase: ')
+        print()
+        passwd_confirm = input('Confirm passphrase: ')
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         print()
 
+    if passwd != passwd_confirm:
+        error_exit('Inputs don\'t match, please try again', code=2)
+
     iter = input('Iterations ({}): '.format(PBKDF2_ITER_DEFAULT)) \
                                                 or str(PBKDF2_ITER_DEFAULT)
-    if iter and (not iter.isdecimal() or int(iter) < 1
-                 or int(iter) >= PBKDF2_ITER_MAX):
+    if iter and not (iter.isdecimal() and 0 < int(iter) < PBKDF2_ITER_MAX):
         error_exit('Iterations count must be 0 < i < {}. '
                    'Use none for default'.format(PBKDF2_ITER_MAX), code=2)
 
-    start_time = time.time()
+    start_time = time.monotonic()
     iter = int(iter)
     salt = os.urandom(PBKDF2_SALT)
     hash = pbkdf2.PBKDF2(passwd, salt, iter).read(PBKDF2_LEN)
-    gen_time = time.time() - start_time
+    gen_time = time.monotonic() - start_time
 
-    encode_token = AnyBase(AnyBase.BASE62, strict_len=False).encode
+    encode_token = AnyBase(strict_len=False).encode
     iter = int.to_bytes(iter, int(math.log(PBKDF2_ITER_MAX, 256)), 'big')
     token = ':'.join([encode_token(element) for element
                       in (iter, salt, hash)])
@@ -1005,8 +1013,8 @@ class AnyBase(object):
                     a binary coding) when not in "strict length" mode, or
                     6 characters otherwise (due to padding). Base-62 is
                     used by default.
-                strict_len (bool, int): For bytes array input only: encode
-                    to a string of fixed length for a given input length
+                strict_len (bool): For bytes array input only: encode to
+                    a string of fixed length for a given input length
                     regardless of input value. If False, the inflation
                     ratio is slightly lower, but encoded output length may
                     vary by a few characters depending on the input and
@@ -1136,8 +1144,8 @@ class IPCServer(UnixStreamServer):
         socketserver.BaseServer.
 
         Attributes:
-            terminate (bool): Stop server flag. Can be used from handler
-                threads to signal graceful shutdown.
+            terminate (bool): Stop server flag. Can be used from request
+                handler to signal graceful shutdown.
             auth_key (bytes): IPC session authentication key.
             client_conn (socket.socket): Opened TCP socket instance of a
                 client connection.
@@ -1159,7 +1167,7 @@ class IPCServer(UnixStreamServer):
     main_server = None
 
     def service_actions(self):
-        """Stop server if signalled from a handler thread."""
+        """Stop server if signalled from request handler."""
         if self.terminate:
             self.shutdown()
 
@@ -1455,12 +1463,12 @@ class Handler(BaseRequestHandler):
             remaining tuple elements in tempdirs cache is: temp_filepath is
             an absolute pathname of a file in the temporary storage, and
             send_back is a bool flag indicating whether this specific file
-            should be returned back to client (this is true for output file
+            should be returned back to client (it is True for output file
             only).
 
             Output file is handled in the same way except no data is
             written to the temporary directory, just tempdir object and
-            temporary file path is cached.
+            temporary file path are cached.
 
             The total number of received files is stored in files_received
             attribute. Note: Output file doesn't get counted.
@@ -1833,6 +1841,7 @@ if __name__ == '__main__':
     except:
         error_exit('Unable to read or parse whitelist file "{}"'.
                    format(whitelist_path), log_level=logging.critical)
+    del file  # Fix for idiotic pylint warning.
 
     Server.gpg_argv = shlex.split(CONFIG['gpg_exec'])
     log('Default GPG invocation tokens: {}'.format(Server.gpg_argv),

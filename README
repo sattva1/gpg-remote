@@ -265,9 +265,9 @@ above mentioned order into a JSON-encoded string, which is passed to HMAC
 context. Authentication is currently used for server<>``pinentry`` IPC
 only. As such, binary data is not authenticated.
 
-Remote passphrase input is implemented using custom ``pinentry`` shim
+Remote passphrase input is implemented using custom ``pinentry.py`` shim
 application. It employs the following communication steps (``pinentry``
-actor below is the custom ``pinentry`` shim application unless otherwise
+actor below is the custom ``pinentry.py`` shim application unless otherwise
 stated):
 
 1. ``server>gpg-agent``: uses ``PINENTRY_USER_DATA`` environment variable
@@ -276,20 +276,22 @@ stated):
    and session authentication key.
 2. ``gpg-agent>pinentry``: calls ``pinentry`` with ``PINENTRY_USER_DATA``
    environment variable and initiates Assuan protocol.
-3. ``server>pinentry``: sends opened client network socket directly to the
+3. ``pinentry>server``: initiates IPC protocol and asks for client network
+   connection data.
+4. ``server>pinentry``: sends opened client network socket directly to the
    custom ``pinentry`` over IPC channel (UNIX socket).
-4. ``pinentry>client``: uses the provided network connection to send the
+5. ``pinentry>client``: uses the provided network connection to send the
    client all the required ``pinentry`` data (text strings and startup
    parameters) got from ``gpg-agent`` at step 2.
-5. ``client``: runs standard ``pinentry`` to aquire user response data (in
+6. ``client``: runs standard ``pinentry`` to aquire user response data (in
    the form of Assuan protocol response).
-6. ``client>pinentry``: sends user response data.
-7. ``pinentry``: executes "panic" commands if any are triggered by the
+7. ``client>pinentry``: sends user response data.
+8. ``pinentry``: executes "panic" commands if any are triggered by the
    client passphrase.
-8. ``pinentry>gpg-agent``: replays user response in Assuan protocol
+9. ``pinentry>gpg-agent``: replays user response in Assuan protocol
    exchange.
 
-If wrong passphrase is entered, steps 2-8 are performed again up to the
+If wrong passphrase is entered, steps 2-9 are performed again up to the
 number of retries required by ``gpg-agent``.
 
 It should be noted that although IPC UNIX socket (used for
@@ -299,7 +301,9 @@ verifies authenticity of packages received using the session auth key it
 provides ``pinentry`` process with.
 
 "Panic" rules security token is a PBKDF2[SHA-1, HMAC] output with effective
-entropy limit of 256 bits. 64-bit salt value is used.
+entropy limit of 256 bits. 64-bit salt value is used. Token format is a
+string of colon-delimited Base62-encoded elements: iterations count
+(in bytes representation), salt, hash.
 
 Default server listening port (29797) was produced in Python as follows:
 
@@ -341,11 +345,17 @@ Issues, limitations
 ToDo
 ----
 
+* One-time passwords support.
 * Minimize memory footprint.
 
 
 Version history
 ---------------
+
+* 2015-03-16 - ``v1.2``
+    - Passphrase confirmation while generating "panic" security token.
+    - Minor aesthetic and code documentation cleanups.
+    - First stable release.
 
 * 2015-02-17 - ``v1.2b``
     - Updated minimum Python version requirement to 3.3 (it was mistakenly

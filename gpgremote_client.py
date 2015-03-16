@@ -25,7 +25,7 @@
 import sys, os, json, io, socket, signal
 
 
-__version__ = '1.2b'
+__version__ = '1.2'
 MIN_PYTHON = (3, 3)
 CONFIG = {
     'host': 'localhost',
@@ -155,12 +155,16 @@ def pack(identifier, *fields, files=None, auth_key=None):
 
         The package is a structure of the following format:
 
-        header|JSON(version, identifier, fields, files_meta)|binary,
+        header|JSON([auth, version], identifier, fields, files_meta)|binary,
 
         where header is a 64-bit (8 bytes) JSON packet length header, and
         binary is a concatenated binary data of all included files.
         Filename and size of each file is included in the last item of JSON
         packet as a list of (filename, file size) 2-tuples.
+
+        Package is authenticated (if auth_key is provided) with HMAC-SHA256
+        over JSON-encoded flat list of package content elements except for
+        binary data. Auth token is in hex notation.
     """
     length = 0
     output = io.BytesIO()

@@ -23,7 +23,7 @@ from pyassuan import common as _common
 from pyassuan import error as _error
 
 
-__version__ = '1.2b'
+__version__ = '1.2'
 IPC_TIMEOUT = 5
 IPC_SIZE_LIMIT = 65536  # Bytes.
 PBKDF2_LEN = 256 // 8  # Bytes.

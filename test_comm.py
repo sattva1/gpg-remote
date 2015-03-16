@@ -70,7 +70,7 @@ class TestPackage(unittest.TestCase):
         self.assertEqual(unpacked_files, {})
 
     def test_auth_fail(self):
-        """Authenticated and contents failed to verify."""
+        """Authenticated contents failed to verify."""
         identifier = 'test_id'
         fields = ['foo', 'bar', 1]
         key = b'key'
