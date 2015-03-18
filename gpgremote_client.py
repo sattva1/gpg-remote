@@ -25,7 +25,7 @@
 import sys, os, json, io, socket, signal
 
 
-__version__ = '1.2'
+__version__ = '1.3'
 MIN_PYTHON = (3, 3)
 CONFIG = {
     'host': 'localhost',
@@ -675,26 +675,43 @@ class PackageHandler(object):
             Args:
                 data (list): Package contents returned by unpack() with
                     identifier element discarded. Packed fields are assumed
-                    to be a list of [strings, options], both of which are
-                    lists of two-tuples.
+                    to be a list of [strings, options, OTP flag, OTP ID].
+                    The first two are lists of two-tuples.
 
             Raises:
                 PyassuanImportError: If pyassuan library is not installed.
         """
         # Expect server data to be format conformant, so not handle errors.
         fields, _ = data
-        strings, options = fields
+        strings, options, otp, otp_id = fields
 
         # Update description string.
+        error_idx = None
         for i, element in enumerate(strings):
             if element[0] == 'SETDESC':
-                strings[i] = (element[0],
-                              'GPG Remote Server:\n' + element[1])
+                text = 'GPG Remote Server:\n\n' + element[1]
+                if otp and otp_id:
+                    text += '\nOTP is enabled, append password {} to ' \
+                            'the private key passphrase\n'.format(otp_id)
+                strings[i] = (element[0], text)
+            elif element[0] == 'SETERROR':
+                error_idx = i
+        # Updating error string if necessary.
+        if otp and not otp_id:
+            text = 'OTP list is exhausted, private key operation ' \
+                   'will fail\n'
+            if error_idx is not None:
+                strings[error_idx] = ('SETERROR', text)
+            else:
+                strings.append(('SETERROR', text))
         # Update ttyname option.
         for i, element in enumerate(options):
             if element[1] is not None \
                             and element[1].split(' ')[0] == 'ttyname':
-                ttyname = os.ttyname(sys.stdin.fileno())
+                try:
+                    ttyname = os.ttyname(sys.stdin.fileno())
+                except OSError:
+                    continue
                 options[i] = (element[0], ' '.join(['ttyname', ttyname]))
 
         response = self._get_pin(options, strings)

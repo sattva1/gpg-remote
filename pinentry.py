@@ -23,7 +23,7 @@ from pyassuan import common as _common
 from pyassuan import error as _error
 
 
-__version__ = '1.2'
+__version__ = '1.3'
 IPC_TIMEOUT = 5
 IPC_SIZE_LIMIT = 65536  # Bytes.
 PBKDF2_LEN = 256 // 8  # Bytes.
@@ -31,6 +31,7 @@ PACKAGE_INIT = 'init'
 PACKAGE_PANIC = 'panic'
 PACKAGE_COMMAND = 'command'
 PACKAGE_PIN = 'pin'
+PACKAGE_OTP = 'otp'
 CONN_BUF = 1024
 # Module placeholders to make IDE happy.
 pbkdf2 = None
@@ -104,6 +105,8 @@ class PinEntry(_server.AssuanServer):
         self.gpg_timeout = None
         self.panic_rules = None
         self.panic_env = None
+        self.otp = False
+        self.otp_expected = (None, None)
 
         super(PinEntry, self).__init__(
             name=name, strict_options=strict_options,
@@ -194,7 +197,8 @@ class PinEntry(_server.AssuanServer):
             data = gpgremote.receive(conn, len_limit=IPC_SIZE_LIMIT)
             identifier, fields, _ = gpgremote.unpack(data, self.auth_key)
             assert_(fields)
-            self.gpg_timeout, self.panic_rules, self.panic_env = fields
+            self.gpg_timeout, self.panic_rules, self.panic_env, \
+                                                        self.otp = fields
             logging.info('Pinentry application data received')
 
             conn.close()
@@ -214,6 +218,52 @@ class PinEntry(_server.AssuanServer):
         except RuntimeError:
             logging.error('Error receiving IPC data')
 
+    def get_otp(self):
+        """ Get one-time password from the server.
+
+            Method combines request to the server and response processing.
+            Server output is assigned to self.otp_expected attribute as a
+            two-tuple of (ID, password).
+        """
+        conn = self.connect_socket()
+        try:
+            package = gpgremote.pack(PACKAGE_OTP, None,
+                                     auth_key=self.auth_key)
+            gpgremote.send(*package, conn=conn)
+
+            data = gpgremote.receive(conn, len_limit=IPC_SIZE_LIMIT)
+            identifier, fields, _ = gpgremote.unpack(data, self.auth_key)
+            assert_(identifier == PACKAGE_OTP)
+
+            otp = fields[0]
+            if otp:
+                self.otp_expected = otp
+        except:
+            pass
+        finally:
+            conn.close()
+
+    def check_otp(self, passphrase):
+        """ Check one-time password.
+
+            Args:
+                passphrase (bytes): User-provided passphrase with appended
+                    one-time password.
+
+            Returns:
+                (bytes) Processed passphrase. The passphrase is either a
+                    user-provided one with OTP stripped off (if OTP is
+                    valid), or 128 random bytes (if OTP was invalid).
+        """
+        otp = self.otp_expected[1].encode()
+        valid = gpgremote.secure_compare(passphrase[-len(otp):], otp)
+        if valid:
+            logging.info('OTP correct')
+            return passphrase[:-len(otp)]
+        else:
+            logging.info('OTP incorrect')
+            return os.urandom(128)
+
     def request_pin(self):
         """ Send passphrase request to the client along with pinentry
         options and strings data.
@@ -224,12 +274,19 @@ class PinEntry(_server.AssuanServer):
         """
         if not self.client_conn:
             return False
+
+        if self.otp:
+            logging.info('OTP mode enabled, requesting OTP from server')
+            self.get_otp()
+            logging.info('OTP data: {}'.format(self.otp_expected))
+
         logging.info('Sending passphrase request to the client')
         get_opt = lambda opt: '{} {}'.format(opt[0], opt[1]) \
                             if opt[1] is not None else opt[0]
         strings = [item for item in self.strings.items()]
         options = [('OPTION', get_opt(opt)) for opt in self.options.items()]
-        package = gpgremote.pack(PACKAGE_PIN, strings, options)
+        package = gpgremote.pack(PACKAGE_PIN, strings, options,
+                                 self.otp, self.otp_expected[0])
         gpgremote.send(*package, conn=self.client_conn)
         logging.debug('Passphrase request sent')
         return True
@@ -255,10 +312,20 @@ class PinEntry(_server.AssuanServer):
             return
         responses, _ = data
 
+        if self.otp and not all(self.otp_expected):
+            # Empty OTP list. Simulating 'Cancel' user response.
+            logging.info('Simulate "Cancel" due to empty OTP list')
+            return [('ERR', '83886179 canceled')]
+
         output = []
         for command, params in responses:
             if params is not None and command != 'ERR':
                 params = base64.b64decode(params.encode())
+                # Checking OTP, stripping it off, and sending passphrase
+                # along. If OTP is invalid, replacing passphrase with
+                # random bytes stub.
+                if self.otp and command == 'D':
+                    params = self.check_otp(params)
             output.append((command, params))
 
         logging.info('Client response received')

@@ -31,7 +31,7 @@
 """
 
 import sys, os, getopt, io, json, shlex, logging, tempfile, \
-        threading, signal, socket, array, math, weakref
+        threading, signal, socket, array, math, weakref, contextlib
 from collections import OrderedDict
 from socketserver import TCPServer, UnixStreamServer, \
                         ThreadingMixIn, BaseRequestHandler
@@ -40,7 +40,7 @@ from subprocess import Popen, PIPE, DEVNULL, check_output, \
                         TimeoutExpired, CalledProcessError
 
 
-__version__ = '1.2'
+__version__ = '1.3'
 MIN_PYTHON = (3, 3)
 CONFIG = OrderedDict({
     'host': 'localhost',
@@ -51,12 +51,14 @@ CONFIG = OrderedDict({
     'queue': 4,
     'size_limit': 2 ** 30 * 1,  # 1 GiB
     'gpg_exec': '/usr/bin/gpg',
+    'otp': False,
     'strict': False,
     'unsafe': False,
     'whitelist_path': os.path.join(os.getenv('GNUPGHOME', '~/.gnupg'),
                                    'whitelist.conf'),
     'config_path': os.path.join(os.getenv('GNUPGHOME', '~/.gnupg'),
                                 'gpgremote_server.conf'),
+    'otp_path': os.path.join(os.getenv('GNUPGHOME', '~/.gnupg'), 'otp'),
     'tempdir': os.getenv('TEMP', '/tmp'),
     'logfile': '',
     'verbosity': 'info',
@@ -68,6 +70,9 @@ IPC_POLL = 0.1
 IPC_TIMEOUT = 5
 IPC_SIZE_LIMIT = 65536  # Bytes.
 IPC_KEY_LEN = 128 // 8  # Bytes.
+OTP_AMOUNT = 20
+OTP_LEN = 32 // 8  # Bytes.
+OTP_LOCK = threading.Lock()
 PBKDF2_ITER_DEFAULT = 1000
 PBKDF2_ITER_MAX = 2 ** 16
 PBKDF2_SALT = 64 // 8  # Bytes.
@@ -77,6 +82,7 @@ PACKAGE_GPG = 'gpg'
 PACKAGE_INIT = 'init'
 PACKAGE_PANIC = 'panic'
 PACKAGE_COMMAND = 'command'
+PACKAGE_OTP = 'otp'
 OUTPUT_OPTS = ['-o', '--output']
 NO_FILES = '[#NO_FILES]'
 CONN_BUF = 4096
@@ -438,10 +444,15 @@ Command line options:
         --strict        Strict mode: prevent GPG invocation if any non-
                         whitelisted option is encountered in command line
                         arguments. Otherwise such options are filtered out
+        --otp           Use one-time passwords for private key operations
+        --otp-path      Use specifified path for one-time passwords file
+                        (default: {otp_path})
+        --gen-otp       Generate and output a new one-time passwords list
+        --otp-left      Print the number of remaining one-time passwords
+        --gen-token     Prompt for user passphrase and output "panic" token
         --unsafe        Skip safety checks on server startup
         --reuse-addr    Reuse already binded listening address:port
         --logfile       Path to log file (log to STDOUT if omitted)
-        --gen-token     Prompt for user passphrase and output "panic" token
     -v, --verbosity     Verbosity level: debug, info, error, critical
     -h, --help          Show this help screen
 """.format(ver=__version__,
@@ -455,7 +466,8 @@ Command line options:
            config=CONFIG['config_path'],
            temp=CONFIG['tempdir'],
            conn_timeout=CONFIG['conn_timeout'],
-           gpg_timeout=CONFIG['gpg_timeout'])
+           gpg_timeout=CONFIG['gpg_timeout'],
+           otp_path=CONFIG['otp_path'])
     print(usage)
     sys.exit(2)
 
@@ -464,10 +476,11 @@ def process_options():
     """Process command line options for server invocation."""
     try:
         shortopts = 'l:t:q:s:g:w:c:v:h'
-        longopts = ['listen=', 'threads=', 'queue=', 'size-limit=', 'gpg=',
+        longopts = ['listen=', 'threads=', 'queue=', 'size-limit=',
                     'whitelist=', 'config=', 'logfile=', 'verbosity=',
-                    'temp=', 'conn-timeout=', 'gpg-timeout=',
-                    'reuse-addr', 'strict', 'unsafe', 'gen-token', 'help']
+                    'gpg=', 'temp=', 'conn-timeout=', 'gpg-timeout=',
+                    'reuse-addr', 'strict', 'unsafe', 'gen-token',
+                    'otp', 'otp-path=', 'gen-otp', 'otp-left', 'help']
         opts, args = getopt.getopt(sys.argv[1:], shortopts, longopts)
     except getopt.GetoptError as exc:
         print(exc)
@@ -477,7 +490,16 @@ def process_options():
         if opt in ('-h', '--help'):
             show_help()
         elif opt == '--gen-token':
-            gen_token()
+            handle_cancel(gen_token)
+        elif opt == '--otp':
+            CONFIG['otp'] = True
+        elif opt == '--otp-path':
+            CONFIG['otp_path'] = os.path.abspath(os.path.expanduser(param))
+        elif opt == '--gen-otp':
+            handle_cancel(gen_otp)
+        elif opt == '--otp-left':
+            print(otp_left())
+            exit(0)
         elif opt in ('-l', '--listen'):
             host, port = param.split(':')
             CONFIG['host'] = host
@@ -514,6 +536,91 @@ def process_options():
             except ValueError:
                 error_exit('Unable to read or parse configuration '
                            'file "{}"'.format(param))
+
+
+def handle_cancel(func):
+    """Ctrl+C handler for user interactive inputs."""
+    try:
+        func()
+    except KeyboardInterrupt:
+        print()
+        error_exit('Cancelled', code=2)
+
+
+@contextlib.contextmanager
+def lock_otp():
+    """Context manager for acquiring OTP lock."""
+    try:
+        while True:
+            if OTP_LOCK.acquire(timeout=0.02):
+                yield
+                return
+    except:
+        pass
+    finally:
+        OTP_LOCK.release()
+
+
+def pop_otp():
+    """Return the topmost OTP (as two-tuple of ID and password, both str)
+    and remove it from the file. If file is empty or not exist, None is
+    returned. The call is thread-safe."""
+    try:
+        with lock_otp():
+            with open(CONFIG['otp_path'], 'r') as file:
+                otps = file.read().splitlines()
+            code = otps.pop(0).split(':') if otps else None
+            with open(CONFIG['otp_path'], 'w') as file:
+                file.write('\n'.join(otps))
+            return code
+    except:
+        return None
+
+
+def otp_left():
+    """Return the amount of remaining OTPs by counting OTP file lines."""
+    with lock_otp():
+        try:
+            with open(CONFIG['otp_path'], 'r') as file:
+                return len(file.readlines())
+        except:
+            return 0
+
+
+def gen_otp():
+    """ Prompt user for the amount and generate a new list of OTPs. The
+    current OTP file with remaining passwords is overwritten.
+
+        OTP file format is a colon-delimited password number and OTP per
+        line.
+    """
+    try:
+        amount = int(input('Number of OTPs to generate ({}): '.
+                           format(OTP_AMOUNT)) or OTP_AMOUNT)
+        if amount < 1:
+            raise ValueError
+    except ValueError:
+        error_exit('Must be an integer greater than zero', code=2)
+
+    base57 = AnyBase(AnyBase.BASE57, strict_len=False)
+    otps = [(i + 1, base57.encode(os.urandom(OTP_LEN)))
+            for i in range(amount)]
+
+    with lock_otp(), open(CONFIG['otp_path'], 'wt') as file:
+        file.write('\n'.join(['{}:{}'.format(i, code) for i, code in otps]))
+
+    print()
+    print('\n'.join(['{:<{just}}{}'.format(str(i) + ')', code,
+                                           just=len(str(amount)) + 3)
+                     for i, code in otps]))
+    print()
+    print('One-time passwords generated and saved successfully. Please\n'
+          'write the list down and keep it in a safe convenient place.\n'
+          'You will need it for each private key use. Generate a new\n'
+          'list at any time by running --gen-otp command again.')
+    print()
+    exit(0)
+
 
 def gen_token():
     """ Prompt user for a passphrase and [optional] iterations count,
@@ -583,7 +690,7 @@ def get_panic_cmds(config):
                 for name, opt in config.items()
                 if name.startswith(PANIC_PREFIX)]
     # Stop with error if crypt(3) format token is found.
-    if any([val[0].find('$') >= 0 for name, val in commands]):
+    if any(['$' in val[0] for _, val in commands]):
         error_exit('crypt(3)-format "panic" security token detected in '
                    'server configuration file. Please use --gen-token '
                    'to regenerate security tokens according to the new '
@@ -997,6 +1104,8 @@ class AnyBase(object):
     """
 
     __null_armor = ord('\x01')
+    BASE57 = '23456789abcdefghijkmnopqrstuvwxyz' \
+             'ABCDEFGHJKLMNPQRSTUVWXYZ'
     BASE62 = '0123456789abcdefghijklmnopqrstuvwxyz' \
              'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
@@ -1201,16 +1310,18 @@ class IPCHandler(BaseRequestHandler):
 
             Provides pinentry process with the following data in response:
             client socket descriptor, GPG execution timeout value, "panic"
-            options definitions, and environment variables for "panic"
-            commands. The actual response consists of two subsequent
-            transmissions: the first one, carrying client socket, uses
-            socket.sendmsg() method; the second one uses regular GPG Remote
-            transmission protocol to transfer the rest of the data.
+            options definitions, environment variables for "panic"
+            commands, OTP mode status flag.
+
+            The actual response consists of two subsequent transmissions:
+            the first one, carrying client socket, uses socket.sendmsg()
+            method; the second one uses regular GPG Remote transmission
+            protocol to transfer the rest of the data.
 
             Args:
                 data (list): Package contents returned by unpack() with
                     identifier element discarded. Package is assumed to be
-                    empty and is ignored, as the request is only to signal
+                    empty and ignored, as the request is only to signal
                     readiness for init data receiving.
         """
         conn = self.request
@@ -1227,11 +1338,30 @@ class IPCHandler(BaseRequestHandler):
 
         # Sending remaining data.
         data = [CONFIG['gpg_timeout'], self.server.panic_rules,
-                self.server.panic_env]
+                self.server.panic_env, CONFIG['otp']]
         package = pack(PACKAGE_INIT, *data, auth_key=self.server.auth_key)
         send(*package, conn=self.request)
 
         log('IPC init data sent successfully', logging.debug)
+
+    def handle_request_otp(self, *data):
+        """ Process 'otp' type request package.
+
+            Sends OTP line elements (a two-tuple of (ID, password)) to
+            pinentry process.
+
+            Args:
+                data (list): Package contents returned by unpack() with
+                    identifier element discarded. Package is assumed to be
+                    empty and ignored.
+        """
+        otp = pop_otp()
+        if not otp:
+            log('OTP list is empty', logging.debug)
+        package = pack(PACKAGE_OTP, otp,
+                       auth_key=self.server.auth_key)
+        send(*package, conn=self.request)
+        log('OTP sent successfully', logging.debug)
 
     def handle_request_panic(self, *data):
         """ Process 'panic' type request package.
@@ -1889,6 +2019,14 @@ if __name__ == '__main__':
 
     log('Strict mode {}'.format('enabled' if CONFIG['strict']
                                 else 'disabled'), logging.info)
+    log('One-time passwords {}'.format('enabled' if CONFIG['otp']
+                                else 'disabled'), logging.info)
+
+    if CONFIG['otp'] and not otp_left():
+        log('The list of one-time passwords is empty. Generate the new '
+            'one, otherwise private key operations would fail',
+            logging.error)
+
     log('Connection timeout (sec): {}'.format(CONFIG['conn_timeout']),
         logging.info)
     log('GPG process timeout (sec): {}'.format(CONFIG['gpg_timeout']),

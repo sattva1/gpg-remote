@@ -96,7 +96,7 @@ class TestTransmission(unittest.TestCase):
 
     def test_long(self):
         """Payload longer than header and socket buffer."""
-        data = b'a' * 1024 * 128  # BUG: Why does it hangs if > 1024*214?
+        data = b'a' * 1024 * 128  # FIXME: Why does it hangs if > 1024*214?
         length = len(data)
         package = io.BytesIO(data)
         server.send(length, package, self.sender)

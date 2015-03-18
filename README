@@ -106,6 +106,35 @@ to server security (see _Security considerations_ section for details).
       considerations_ section below).
 
 
+One-time passwords
+------------------
+
+An extra security measure for private key protection is _one-time passwords
+(OTP)_. When enabled, it will require user to enter a short random string
+(from a pre-generated list) along with private key passphrase. This will
+thwart adversary's attempts to use private key over GPG Remote by passing a
+sniffed passphrase. (Please note: bundled GPG Remote ``pinentry.py`` must
+be used, see _Installation_ section above for detailed requirements.)
+
+To use this feature, enable it in server configuration file or with
+``--otp`` startup option. Then run the server with ``--gen-otp`` option and
+enter the number of one-time passwords to generate. The longer the list,
+the later it will has to be replenished, but the wider will be the window
+of opportunity for the attacker if OTP list gets compromised. Note: the
+list can be regenerated at any moment, and any passwords left in it will be
+invalidated; regenerating OTP list does not requires server restart.
+
+Once OTP is enabled, a next password from the list will be required each
+time a private key passphrase is prompted - an OTP must be appended to
+the end of passphrase (without spaces or other delimiters). An entered OTP
+is invalidated, i.e. if the passphrase is mistyped, the next OTP will be
+requested on each retry. Once OTP list is depleted, any private key
+operation will fail until the new list is generated.
+
+Please note that ``gpg-agent`` passphrase caching bypasses OTP: while the
+passphrase is cached, the key could be used without user interaction.
+
+
 "Panic" rules
 -------------
 
@@ -234,6 +263,10 @@ for the whole duration of ``gpg`` execution, and during that period it's
 subject to a risk of memory swapping. Make sure client swapping device is
 encrypted, disabled, or other protective measures are employed.
 
+One-time passwords (OTP) is a mere access control mechanism enforced by GPG
+Remote. As such, it does not affects any cryptographic material, and must
+not be expected to deliver specific cryptographic properties, e.g. PFS.
+
 If "panic" rules are configured on the server with high hashing iterations
 count, an adversary can potentially deduce this fact from a delay of ``gpg``
 output as user passphrase must be matched to each unique security token.
@@ -300,6 +333,10 @@ allow running server and ``gpg-agent`` under different users), server
 verifies authenticity of packages received using the session auth key it
 provides ``pinentry`` process with.
 
+The one-time passwords (OTP) list is stored on the server in plaintext.
+Each line of OTP list file is a colon-delimited ID number and the actual
+password string.
+
 "Panic" rules security token is a PBKDF2[SHA-1, HMAC] output with effective
 entropy limit of 256 bits. 64-bit salt value is used. Token format is a
 string of colon-delimited Base62-encoded elements: iterations count
@@ -351,6 +388,10 @@ ToDo
 
 Version history
 ---------------
+
+* 2015-03-XX - ``v1.3``
+    - Added support for one-time passwords.
+    - Fixed a case with pinentry and stdin pipe.
 
 * 2015-03-16 - ``v1.2``
     - Passphrase confirmation while generating "panic" security token.
