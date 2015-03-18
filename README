@@ -389,7 +389,7 @@ ToDo
 Version history
 ---------------
 
-* 2015-03-XX - ``v1.3``
+* 2015-03-18 - ``v1.3``
     - Added support for one-time passwords.
     - Fixed a case with pinentry and stdin pipe.
 
